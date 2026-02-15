@@ -261,9 +261,9 @@ class PowerWatchdogDiscoveryService:
 
     def _on_discovery_changed(self, path, value):
         """Called when the discovery toggle is changed."""
-        enabled = (value == 1)
+        enabled = bool(int(value) if isinstance(value, str) else value)
         logger.info("Discovery %s", "enabled" if enabled else "disabled")
-        self._settings["DiscoveryEnabled"] = value
+        self._settings["DiscoveryEnabled"] = 1 if enabled else 0
 
         if enabled:
             self._start_scanning()
@@ -404,7 +404,7 @@ class PowerWatchdogDiscoveryService:
             return True
 
         mac_id = path_parts[2].replace("relay_", "")
-        enabled = (value == 1)
+        enabled = bool(int(value) if isinstance(value, str) else value)
 
         # Get device name
         name_path = "/SwitchableOutput/relay_%s/Name" % mac_id
@@ -533,40 +533,30 @@ class PowerWatchdogDiscoveryService:
             group = "Devices/power_watchdog"
             prefix = "Device_%s" % mac_id
 
-            # Add/update Enabled setting
-            try:
-                settings_iface.AddSetting(
-                    group, "%s/Enabled" % prefix,
-                    1 if enabled else 0,
-                    "i", 0, 1,
-                )
-            except dbus.exceptions.DBusException:
-                path = "/Settings/%s/%s/Enabled" % (group, prefix)
-                proxy = self._bus.get_object("com.victronenergy.settings", path)
-                proxy.SetValue(1 if enabled else 0)
-
-            # Add/update Name setting
-            try:
-                settings_iface.AddSetting(
-                    group, "%s/Name" % prefix,
-                    name, "s", 0, 0,
-                )
-            except dbus.exceptions.DBusException:
-                path = "/Settings/%s/%s/Name" % (group, prefix)
-                proxy = self._bus.get_object("com.victronenergy.settings", path)
-                proxy.SetValue(name)
-
-            # Add/update MAC setting
+            # Ensure settings exist (AddSetting is a no-op if already present)
+            settings_iface.AddSetting(
+                group, "%s/Enabled" % prefix, 0, "i", 0, 1,
+            )
+            settings_iface.AddSetting(
+                group, "%s/Name" % prefix, name, "s", 0, 0,
+            )
             if mac_address:
-                try:
-                    settings_iface.AddSetting(
-                        group, "%s/MAC" % prefix,
-                        mac_address, "s", 0, 0,
-                    )
-                except dbus.exceptions.DBusException:
-                    path = "/Settings/%s/%s/MAC" % (group, prefix)
-                    proxy = self._bus.get_object("com.victronenergy.settings", path)
-                    proxy.SetValue(mac_address)
+                settings_iface.AddSetting(
+                    group, "%s/MAC" % prefix, mac_address, "s", 0, 0,
+                )
+
+            # Always SetValue to persist the current state
+            base = "/Settings/%s/%s" % (group, prefix)
+
+            proxy = self._bus.get_object("com.victronenergy.settings", base + "/Enabled")
+            proxy.SetValue(1 if enabled else 0)
+
+            proxy = self._bus.get_object("com.victronenergy.settings", base + "/Name")
+            proxy.SetValue(name)
+
+            if mac_address:
+                proxy = self._bus.get_object("com.victronenergy.settings", base + "/MAC")
+                proxy.SetValue(mac_address)
 
         except Exception:
             logger.exception("Failed to save device %s to settings", mac_id)
