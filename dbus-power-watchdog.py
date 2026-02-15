@@ -263,20 +263,18 @@ class PowerWatchdogDiscoveryService:
 
         if enabled:
             self._start_scanning()
-            # Show all per-device switches
+            # Show per-device switches
             for mac_id in self._device_info:
                 show_path = "/SwitchableOutput/relay_%s/Settings/ShowUIControl" % mac_id
                 if show_path in self._dbusservice:
                     self._dbusservice[show_path] = 1
         else:
             self._stop_scanning()
-            # Keep enabled devices visible, only hide disabled ones
+            # Hide per-device switches (consistent with SeeLevel / BLE Advertisements)
             for mac_id in self._device_info:
                 show_path = "/SwitchableOutput/relay_%s/Settings/ShowUIControl" % mac_id
-                state_path = "/SwitchableOutput/relay_%s/State" % mac_id
-                if show_path in self._dbusservice and state_path in self._dbusservice:
-                    device_enabled = self._dbusservice[state_path]
-                    self._dbusservice[show_path] = 1 if device_enabled else 0
+                if show_path in self._dbusservice:
+                    self._dbusservice[show_path] = 0
 
         return True
 
