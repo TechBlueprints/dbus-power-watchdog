@@ -165,10 +165,12 @@ an ESS-style layout that:
   **Non-Essential Loads** (AC input) instead of showing a single AC Loads
   value
 
-This is a [known, long-standing VRM limitation](https://github.com/victronenergy/venus/issues/1263)
+This is a [known, long-standing VRM limitation](https://github.com/victronenergy/venus/issues/1590)
 based on an old design assumption that systems with external grid meters
 do not have DC loads.  It affects all external grid meter drivers, including
-Victron-maintained ones like `dbus-cgwacs` and `dbus-shelly`.
+Victron-maintained ones like `dbus-cgwacs` and `dbus-shelly`.  We filed
+[venus#1590](https://github.com/victronenergy/venus/issues/1590) to track
+this with Victron.
 
 The local Cerbo GUI and `venus-html5-app` (used on MFDs) render correctly
 in all configurations -- they show DC Loads whenever `/Dc/System/Power` has
