@@ -226,6 +226,29 @@ a value, and use `/Ac/Consumption` for AC Loads without the ESS split.
 No D-Bus workaround exists; the fix requires a VRM portal UI change by
 Victron Energy.
 
+### Error Code Display (Fronius ProductId Workaround)
+
+The Power Watchdog publishes BLE error codes (0-9) to `/ErrorCode` on its
+grid service.  However, the Venus OS GUI (`ListAcInError.qml`) only
+displays the error code row for two hard-coded product IDs:
+
+- **Fronius PV Inverter** (`0xA142`) — shows the raw error code number
+- **Carlo Gavazzi Energy Meter** (`0xB002`) — shows a translated message
+
+For any other `ProductId`, the error row is hidden entirely.
+
+As a workaround, this service sets its `/ProductId` to `0xA142` (Fronius).
+The Fronius code path simply displays the raw error number, which is the
+correct behavior for our use case.  This only affects the error display
+logic in `ListAcInError.qml` — no other GUI components use the Fronius
+product ID for conditional behavior.
+
+We have submitted a pull request to `victronenergy/gui-v2` to make error
+code display generic for all energy meters:
+[gui-v2#2816](https://github.com/victronenergy/gui-v2/pull/2816).
+Once that PR is accepted, we will switch to a dedicated product ID and
+remove this workaround.
+
 ## Configuration
 
 Optional: copy `config.default.ini` to `config.ini` to customize:

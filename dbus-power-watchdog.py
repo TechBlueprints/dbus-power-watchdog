@@ -65,7 +65,7 @@ from power_watchdog_ble import (  # noqa: E402
     DiscoveredDevice,
 )
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,6 +84,14 @@ POLL_INTERVAL_MS_PER_STEP = 100
 # Default reconnect parameters for the BLE client
 DEFAULT_RECONNECT_DELAY = 10
 DEFAULT_RECONNECT_MAX_DELAY = 120
+
+# Fronius PV-inverter ProductId (0xA142).  We use this so the Venus OS GUI
+# displays our /ErrorCode — ListAcInError.qml only shows the error row for
+# Fronius or Carlo Gavazzi product IDs.  The Fronius path is the simplest:
+# it renders the raw error code number.
+# TODO: switch to a generic product ID once gui-v2#2816 is accepted:
+# https://github.com/victronenergy/gui-v2/pull/2816
+PRODUCT_ID_FRONIUS = 0xA142
 
 # Valid roles and their D-Bus service class
 ALLOWED_ROLES = ["grid", "pvinverter", "genset"]
@@ -723,7 +731,7 @@ class PowerWatchdogService:
 
         device_instance = 40 + (int(mac_id, 16) % 260)
         svc.add_path("/DeviceInstance", device_instance)
-        svc.add_path("/ProductId", 0xFFFF)
+        svc.add_path("/ProductId", PRODUCT_ID_FRONIUS)
         svc.add_path("/ProductName", "Hughes Power Watchdog")
         svc.add_path("/CustomName", self._grid_settings["custom_name"],
                       writeable=True, onchangecallback=self._on_custom_name_changed)
