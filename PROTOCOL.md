@@ -141,7 +141,7 @@ Each 34-byte block represents measurements for a single AC line:
 | 24     | 1 byte  | uint8        | Backlight         |                       |
 | 25     | 1 byte  | uint8        | Neutral Detection |                       |
 | 26     | 1 byte  | uint8        | Boost Flag        | 1 = boosting          |
-| 27     | 1 byte  | uint8        | Temperature       | Degrees (encoding TBD)|
+| 27     | 1 byte  | uint8        | Temperature       | Degrees; E8/V8 only   |
 | 28     | 4 bytes | int32 (BE)   | Frequency         | /100 = Hz             |
 | 32     | 1 byte  | uint8        | Error Code        | 0-14 (see table below)|
 | 33     | 1 byte  | uint8        | Status            |                       |
@@ -160,6 +160,9 @@ All multi-byte integers are **big-endian signed 32-bit** (`int32`).
 - **Backlight**: Display backlight state on the physical device.
 - **Temperature 1** (offset 16): Reserved; not used in current firmware.
 - **Temperature** (offset 27): Device internal temperature reading.
+  **E8/V8 models only** — the decompiled Android app exposes this value via
+  `getTemperatureE8()`, confirming it is model-specific. Other models
+  (E5/V5, E6/V6, E7/V7, E9/V9) transmit `0` for this byte.
 - **Status**: Device operational status byte.
 
 ## Error Codes
@@ -258,4 +261,4 @@ immediate attention.
 | Status           | DLData[33]      | Direct   | —    | Device status byte |
 | Backlight        | DLData[24]      | Direct   | —    | Display backlight state |
 | Neutral Detection| DLData[25]      | Direct   | —    | Neutral wire detection |
-| Temperature      | DLData[27]      | Direct   | —    | Internal temperature |
+| Temperature      | DLData[27]      | Direct   | —    | Internal temperature (E8/V8 only) |
