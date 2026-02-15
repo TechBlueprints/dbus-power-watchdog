@@ -6,6 +6,6 @@ exec 2>&1
 # Brief delay on restart to allow D-Bus name release from previous instance
 sleep 3
 
-echo "Starting Power Watchdog BLE grid meter service..."
+echo "Starting Power Watchdog discovery service..."
 cd /data/apps/dbus-power-watchdog
 exec softlimit -d 150000000 -s 2000000 -a 150000000 python3 -u dbus-power-watchdog.py

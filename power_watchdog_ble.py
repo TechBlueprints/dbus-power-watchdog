@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 """
 BLE client for the Hughes Power Watchdog surge protector.
 
@@ -67,9 +69,24 @@ _serialbattery_ext = "/data/apps/dbus-serialbattery/ext"
 if os.path.isdir(_serialbattery_ext) and _serialbattery_ext not in sys.path:
     sys.path.insert(0, _serialbattery_ext)
 
-from bleak import BleakClient, BleakScanner  # noqa: E402
+from bleak import BleakClient, BleakScanner, BleakError  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+# ── Discovery name patterns ─────────────────────────────────────────────────
+
+# Gen2 (WiFi+BT) devices advertise as "WD_{type}_{serialhex}"
+# Types: E5, E6, E7, E8, E9, V5, V6, V7, V8, V9
+GEN2_PREFIX = "WD_"
+
+# Gen1 (BT-only) devices advertise as "PM{S|D}..." (19 or 27 chars)
+# S = single/30A, D = double/50A
+GEN1_PREFIX = "PM"
+
+# Maximum retries when BLE scanner reports InProgress
+SCAN_MAX_RETRIES = 3
+SCAN_RETRY_DELAY = 5.0  # seconds between retries
 
 # ── Protocol constants ──────────────────────────────────────────────────────
 
@@ -119,6 +136,185 @@ class WatchdogData:
     has_l2: bool = False
     timestamp: float = 0.0
     raw_hex: str = ""          # last raw notification for debugging
+
+
+# ── Discovery ────────────────────────────────────────────────────────────────
+
+@dataclass
+class DiscoveredDevice:
+    """A Power Watchdog device found during BLE scanning."""
+    mac: str               # MAC address (e.g., "24:EC:4A:E4:69:A5")
+    name: str              # BLE advertised name (e.g., "WD_E7_26ec4ae469a5")
+    generation: int = 0    # 1 = gen1 (BT-only), 2 = gen2 (WiFi+BT)
+    device_type: str = ""  # e.g., "E7" for gen2, "PMD" for gen1 50A
+    line_type: str = ""    # "single" (30A) or "double" (50A)
+
+
+def classify_device(name: str) -> DiscoveredDevice | None:
+    """Classify a BLE device name as a Power Watchdog, or return None.
+
+    Gen2 (WiFi+BT): Name starts with "WD_", format "WD_{type}_{serialhex}".
+    Gen1 (BT-only): Name starts with "PM", 19 or 27 chars, "PMS"=30A, "PMD"=50A.
+    """
+    if not name:
+        return None
+
+    # Gen2: WD_{type}_{serialhex}
+    if name.startswith(GEN2_PREFIX):
+        parts = name.split("_")
+        if len(parts) == 3:
+            device_type = parts[1]
+            # E-types and V-types: 5/6=30A, 7/8/9=50A (based on product line)
+            line_type = "unknown"
+            if device_type and len(device_type) == 2:
+                model_num = device_type[1]
+                if model_num in ("5", "6"):
+                    line_type = "single"
+                elif model_num in ("7", "8", "9"):
+                    line_type = "double"
+            return DiscoveredDevice(
+                mac="",  # filled in by caller
+                name=name,
+                generation=2,
+                device_type=device_type,
+                line_type=line_type,
+            )
+
+    # Gen1: PM{S|D}... (19 chars, or 27 with trailing spaces)
+    if name.startswith(GEN1_PREFIX):
+        effective_name = name.rstrip()
+        if len(effective_name) == 19:
+            third_char = effective_name[2] if len(effective_name) > 2 else ""
+            if third_char == "S":
+                line_type = "single"
+            elif third_char == "D":
+                line_type = "double"
+            else:
+                line_type = "unknown"
+            return DiscoveredDevice(
+                mac="",  # filled in by caller
+                name=name,
+                generation=1,
+                device_type=effective_name[:3],  # e.g., "PMD", "PMS"
+                line_type=line_type,
+            )
+
+    return None
+
+
+async def _scan_once(
+    adapter: str = "",
+    timeout: float = 15.0,
+) -> list[DiscoveredDevice]:
+    """Perform a single BLE scan and return discovered Power Watchdog devices.
+
+    Args:
+        adapter: Bluetooth adapter to use (e.g., "hci0"). Empty for default.
+        timeout: Scan timeout in seconds.
+
+    Returns:
+        List of DiscoveredDevice instances found during this scan.
+
+    Raises:
+        BleakError: If the scanner reports an error (e.g., InProgress).
+    """
+    kwargs = {}
+    if adapter:
+        kwargs["adapter"] = adapter
+
+    devices = await BleakScanner.discover(timeout=timeout, **kwargs)
+    found: list[DiscoveredDevice] = []
+
+    for device in devices:
+        name = device.name or ""
+        classified = classify_device(name)
+        if classified is not None:
+            classified.mac = device.address
+            found.append(classified)
+            logger.info(
+                "Discovered Power Watchdog: %s (%s) gen%d %s %s",
+                name, device.address, classified.generation,
+                classified.device_type, classified.line_type,
+            )
+
+    return found
+
+
+async def scan_for_devices(
+    adapters: list[str] | None = None,
+    timeout: float = 15.0,
+) -> list[DiscoveredDevice]:
+    """Scan for Power Watchdog BLE devices with retry and adapter rotation.
+
+    Handles BLE InProgress errors by retrying with exponential backoff.
+    If multiple adapters are specified, rotates through them on failure.
+
+    Args:
+        adapters: List of adapters to try (e.g., ["hci0", "hci1"]).
+                  None or empty list means use the default adapter.
+        timeout: Scan timeout per attempt in seconds.
+
+    Returns:
+        List of all unique DiscoveredDevice instances found.
+    """
+    if not adapters:
+        adapters = [""]  # empty string = default adapter
+
+    seen_macs: set[str] = set()
+    all_found: list[DiscoveredDevice] = []
+
+    for adapter in adapters:
+        adapter_label = adapter or "default"
+        retries = 0
+        delay = SCAN_RETRY_DELAY
+
+        while retries < SCAN_MAX_RETRIES:
+            try:
+                logger.info(
+                    "Scanning for Power Watchdog devices on %s (attempt %d/%d)...",
+                    adapter_label, retries + 1, SCAN_MAX_RETRIES,
+                )
+                found = await _scan_once(adapter=adapter, timeout=timeout)
+                for dev in found:
+                    if dev.mac not in seen_macs:
+                        seen_macs.add(dev.mac)
+                        all_found.append(dev)
+                # Successful scan -- break retry loop for this adapter
+                break
+
+            except BleakError as e:
+                err_str = str(e).lower()
+                if "inprogress" in err_str or "in progress" in err_str:
+                    retries += 1
+                    if retries < SCAN_MAX_RETRIES:
+                        logger.warning(
+                            "BLE scan InProgress on %s, retrying in %.0fs (%d/%d)",
+                            adapter_label, delay, retries, SCAN_MAX_RETRIES,
+                        )
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 1.5, 30.0)
+                    else:
+                        logger.warning(
+                            "BLE scan InProgress on %s after %d retries, "
+                            "moving to next adapter",
+                            adapter_label, SCAN_MAX_RETRIES,
+                        )
+                else:
+                    logger.error("BLE scan error on %s: %s", adapter_label, e)
+                    break  # non-retryable error
+
+            except Exception:
+                logger.exception("Unexpected error scanning on %s", adapter_label)
+                break
+
+    if all_found:
+        logger.info(
+            "Discovery complete: found %d Power Watchdog device(s)", len(all_found)
+        )
+    else:
+        logger.info("Discovery complete: no Power Watchdog devices found")
+
+    return all_found
 
 
 # ── BLE client ──────────────────────────────────────────────────────────────
