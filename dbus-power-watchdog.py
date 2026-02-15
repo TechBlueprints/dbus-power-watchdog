@@ -239,13 +239,17 @@ class PowerWatchdogDiscoveryService:
 
     @staticmethod
     def _detect_adapters() -> list[str]:
-        """Detect available Bluetooth adapters on the system."""
+        """Detect available Bluetooth adapters on the system.
+
+        /sys/class/bluetooth contains both adapters (hci0, hci1) and active
+        connection handles (hci0:16, hci1:18).  We only want the adapters.
+        """
         adapters = []
         try:
             hci_dir = "/sys/class/bluetooth"
             if os.path.isdir(hci_dir):
                 for entry in sorted(os.listdir(hci_dir)):
-                    if entry.startswith("hci"):
+                    if entry.startswith("hci") and ":" not in entry:
                         adapters.append(entry)
         except Exception:
             logger.exception("Failed to detect BLE adapters")
