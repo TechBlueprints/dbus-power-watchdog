@@ -4,6 +4,25 @@ This document describes the Bluetooth Low Energy (BLE) communication
 protocol used by Hughes Power Watchdog surge protectors, covering both
 Gen1 (BT-only) and Gen2 (WiFi+BT) hardware.
 
+## Gen1 vs Gen2: Protocol Compatibility
+
+The BLE data protocol is **identical** between Gen1 and Gen2 hardware.
+Both generations use the same GATT characteristic, handshake sequence,
+packet framing, and 34-byte DLData block layout. A single client
+implementation handles both without any generation-specific branching.
+
+The differences between generations are limited to:
+
+| Aspect               | Gen1 (BT-only)         | Gen2 (WiFi+BT)               |
+|----------------------|------------------------|-------------------------------|
+| BLE name pattern     | `PM{S\|D}...` (19 chars) | `WD_{type}_{serial}`        |
+| Connectivity         | Bluetooth only         | WiFi + Bluetooth              |
+| Error codes          | 0-9, 11-12             | 0-9, 11-14 (adds 13, 14)     |
+| GATT characteristic  | `0000ff01...` (same)   | `0000ff01...` (same)          |
+| Handshake            | `!%!%,protocol,open,`  | `!%!%,protocol,open,` (same)  |
+| Packet framing       | Identical              | Identical                     |
+| DLData block layout  | Identical (34 bytes)   | Identical (34 bytes)          |
+
 ## Device Generations
 
 ### Gen2 (WiFi+BT)
