@@ -25,7 +25,7 @@ on configured role) so that Venus OS treats the data as an AC input.
 
 Usage:
     python3 power_watchdog_device.py --mac XX:XX:XX:XX:XX:XX [--adapter hciN] \\
-        [--update-interval 5] [--reconnect-delay 10] [--reconnect-max-delay 120]
+        [--update-interval-ms 5000] [--reconnect-delay 10] [--reconnect-max-delay 120]
 """
 
 import argparse
@@ -108,16 +108,16 @@ class PowerWatchdogDeviceService:
     """Venus OS D-Bus grid meter service for a single Power Watchdog BLE device."""
 
     def __init__(self, mac_address: str, adapter: str = "",
-                 update_interval: int = 5,
+                 update_interval_ms: int = 5000,
                  reconnect_delay: float = 10.0,
                  reconnect_max_delay: float = 120.0):
         self._mac_address = mac_address
         self._mac_id = mac_address.replace(":", "").lower()
-        self._update_interval = update_interval
+        self._update_interval_ms = update_interval_ms
 
         logger.info("Power Watchdog MAC: %s", self._mac_address)
         logger.info("BLE adapter: %s", adapter or "auto")
-        logger.info("Update interval: %ds", self._update_interval)
+        logger.info("Update interval: %dms", self._update_interval_ms)
 
         # Start BLE client in daemon thread
         self._ble = PowerWatchdogBLE(
@@ -132,6 +132,7 @@ class PowerWatchdogDeviceService:
 
         # Persistent settings via com.victronenergy.settings (localsettings)
         settings_path = "/Settings/Devices/power_watchdog_%s" % self._mac_id
+        global_path = "/Settings/Devices/power_watchdog"
         self._settings = SettingsDevice(
             bus=dbus.SystemBus(private=True) if "DBUS_SESSION_BUS_ADDRESS" not in os.environ
                 else dbus.SessionBus(private=True),
@@ -139,10 +140,26 @@ class PowerWatchdogDeviceService:
                 "role": ["%s/Role" % settings_path, "grid", 0, 0],
                 "custom_name": ["%s/CustomName" % settings_path, "Power Watchdog", 0, 0],
                 "position": ["%s/Position" % settings_path, 0, 0, 2],
+                "poll_interval_ms": [
+                    "%s/PollIntervalMs" % global_path,
+                    update_interval_ms,  # default from CLI arg
+                    100,   # min
+                    10000, # max
+                ],
             },
             eventCallback=self._handle_setting_changed,
             timeout=10,
         )
+
+        # Override CLI interval with the live setting value (parent may have
+        # changed it after we were spawned)
+        try:
+            saved_ms = int(self._settings["poll_interval_ms"])
+            if 100 <= saved_ms <= 10000:
+                self._update_interval_ms = saved_ms
+                logger.info("Polling interval from settings: %dms", saved_ms)
+        except Exception:
+            pass  # keep CLI default
 
         # State
         self._dbusservice = None
@@ -215,7 +232,7 @@ class PowerWatchdogDeviceService:
                                    onchangecallback=self._on_position_changed)
 
         # Refresh time (measurement interval in ms)
-        self._dbusservice.add_path("/RefreshTime", self._update_interval * 1000)
+        self._dbusservice.add_path("/RefreshTime", self._update_interval_ms)
 
         # AC total paths
         self._dbusservice.add_path("/Ac/Power", None, gettextcallback=_fmt_w)
@@ -252,8 +269,8 @@ class PowerWatchdogDeviceService:
         self._dbusservice.register()
         logger.info("Registered on D-Bus as %s (role=%s)", servicename, role)
 
-        # Set up periodic update via GLib timer
-        self._timer_id = GLib.timeout_add_seconds(self._update_interval, self._update)
+        # Set up periodic update via GLib timer (milliseconds)
+        self._timer_id = GLib.timeout_add(self._update_interval_ms, self._update)
 
     # ── Settings callbacks ──────────────────────────────────────────────────
 
@@ -295,6 +312,23 @@ class PowerWatchdogDeviceService:
             self._dbusservice["/CustomName"] = newvalue
         elif setting == "position" and self._dbusservice is not None:
             self._dbusservice["/Position"] = newvalue
+        elif setting == "poll_interval_ms":
+            self._reschedule_timer(int(newvalue))
+
+    def _reschedule_timer(self, new_ms: int):
+        """Change the polling interval without restarting BLE."""
+        new_ms = max(100, min(new_ms, 10000))
+        if new_ms == self._update_interval_ms:
+            return
+        logger.info("Polling interval changed: %dms -> %dms", self._update_interval_ms, new_ms)
+        self._update_interval_ms = new_ms
+        # Cancel existing timer and start a new one at the new rate
+        if self._timer_id is not None:
+            GLib.source_remove(self._timer_id)
+        self._timer_id = GLib.timeout_add(self._update_interval_ms, self._update)
+        # Update the D-Bus RefreshTime path
+        if self._dbusservice is not None:
+            self._dbusservice["/RefreshTime"] = self._update_interval_ms
 
     # ── Update loop ─────────────────────────────────────────────────────────
 
@@ -395,8 +429,8 @@ def parse_args():
         help="Bluetooth adapter to use (e.g., hci0, hci1). Empty for auto."
     )
     parser.add_argument(
-        "--update-interval", type=int, default=5,
-        help="D-Bus update interval in seconds (default: 5)"
+        "--update-interval-ms", type=int, default=5000,
+        help="D-Bus update interval in milliseconds (default: 5000)"
     )
     parser.add_argument(
         "--reconnect-delay", type=float, default=10.0,
@@ -417,7 +451,7 @@ def main():
     service = PowerWatchdogDeviceService(
         mac_address=args.mac,
         adapter=args.adapter,
-        update_interval=args.update_interval,
+        update_interval_ms=args.update_interval_ms,
         reconnect_delay=args.reconnect_delay,
         reconnect_max_delay=args.reconnect_max_delay,
     )

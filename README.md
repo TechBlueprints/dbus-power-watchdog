@@ -5,14 +5,19 @@ protectors via Bluetooth Low Energy.
 
 ## Overview
 
-A discovery service scans BLE for Power Watchdog devices and presents them
-as toggles in the Venus OS switches pane.  When a device is enabled, a
-dedicated child process connects to it via BLE and publishes L1/L2 AC
-voltage, current, power, energy, and frequency to the Venus OS D-Bus.
+A single-process Venus OS service that scans BLE for Power Watchdog devices
+and presents them as dimmable switches in the Venus OS switches pane.  When
+a device is enabled, the service connects to it via BLE and publishes
+L1/L2 AC voltage, current, power, energy, and frequency to the Venus OS
+D-Bus.
+
+**Only one Power Watchdog device may be active at a time.**  Enabling a
+device automatically disables any previously active one.  Each device's
+switch includes a slider to control the polling interval (100ms-10000ms).
 
 Supports role assignment as a grid meter, generator meter, or PV inverter
-meter.  Settings (role, custom name, position) are persisted via
-`com.victronenergy.settings` and survive reboots.
+meter.  Settings (role, custom name, position, polling interval) are
+persisted via `com.victronenergy.settings` and survive reboots.
 
 Supports both 30A (single-line) and 50A (dual-line L1+L2) Power Watchdog
 models, including gen1 (BT-only) and gen2 (WiFi+BT) hardware.
@@ -30,20 +35,20 @@ models, including gen1 (BT-only) and gen2 (WiFi+BT) hardware.
 ## Architecture
 
 ```
-dbus-power-watchdog.py          (discovery / management process)
+dbus-power-watchdog.py          (single process — discovery + BLE + grid service)
   ├─ Registers as com.victronenergy.switch.power_watchdog
   ├─ Discovery toggle in Venus OS switches pane
-  ├─ Per-device enable/disable toggles
+  ├─ Per-device dimmable switches (on/off + polling interval slider)
   ├─ "Report AC Input Loads" system toggle (HasAcInLoads)
   ├─ "Use Inverter Metering" system toggle (RunWithoutGridMeter)
-  └─ Spawns child processes for enabled devices:
-      │
-      ├─ power_watchdog_device.py --mac AA:BB:CC:DD:EE:FF
-      │    └─ com.victronenergy.grid.power_watchdog_aabbccddeeff
-      │
-      └─ power_watchdog_device.py --mac 11:22:33:44:55:66
-           └─ com.victronenergy.grid.power_watchdog_112233445566
+  └─ When a device is enabled:
+       ├─ Connects to the Power Watchdog via BLE (daemon thread)
+       └─ Registers com.victronenergy.grid.power_watchdog_{mac_id}
 ```
+
+Only one device may be active at a time.  Enabling a second device
+automatically disables the first.  `power_watchdog_device.py` is retained
+as a standalone fallback for manual use.
 
 ## Sensors
 
@@ -111,15 +116,43 @@ bash enable.sh
 2. Open the Venus OS Remote Console or VRM
 3. Navigate to **Settings > I/O > Switches** (or the device list)
 4. Find "Power Watchdog Manager" and enable **Device Discovery**
-5. Discovered Power Watchdog devices will appear as toggles
-6. Enable a device to start reading AC data
-7. The device will appear as a grid meter (or genset/pvinverter after role change)
+5. Discovered Power Watchdog devices will appear as dimmable switches
+6. Enable a device to start reading AC data (only one may be active at a time)
+7. Use the slider to adjust the polling interval (100ms-10000ms)
+8. The device will appear as a grid meter (or genset/pvinverter after role change)
 
-## System Settings (GUI Toggles)
+## System Settings (GUI Controls)
 
-The Power Watchdog Manager pane exposes two additional system-level toggles.
-These control Venus OS settings that affect how the Cerbo GX, VRM portal,
-and `dbus-systemcalc-py` interpret your system topology.
+The Power Watchdog Manager pane exposes additional controls beyond the
+discovery toggle.  Each discovered device has its own polling interval
+slider (see below), and two system-level toggles affect how Venus OS
+interprets your system topology.
+
+### Per-Device Polling Interval
+
+**Persistent setting:** `/Settings/Devices/power_watchdog/Device_{mac_id}/PollIntervalMs`
+**Default:** 5000ms (slider position 50)
+
+Each discovered Power Watchdog device appears as a **dimmable switch**
+(Type 2) in the Venus OS switches pane.  The switch has two controls:
+
+- **State** (on/off): Enables or disables the BLE connection for this device
+- **Dimming** (slider 1-100): Controls the polling interval
+
+Each slider step is 100ms:
+
+| Slider | Interval | Notes |
+|--------|----------|-------|
+| 1 | 100ms | Fastest; highest BLE traffic |
+| 50 | 5000ms | Default; good balance of responsiveness and efficiency |
+| 100 | 10000ms | Slowest; lowest BLE overhead |
+
+The switch name label updates in real-time to show the current interval,
+e.g. `WD_E7_26ec4ae469a5 (5000ms)`.
+
+Slider changes are **debounced by 5 seconds** before taking effect.  This
+prevents rapid GUI dragging from causing excessive BLE rescheduling.  The
+interval is persisted per device and restored on reboot.
 
 ### Report AC Input Loads (`HasAcInLoads`)
 
@@ -197,13 +230,13 @@ Optional: copy `config.default.ini` to `config.ini` to customize:
 [DEFAULT]
 scan_interval = 60
 bluetooth_adapters = hci0,hci1
-update_interval = 5
 reconnect_delay = 10
 reconnect_max_delay = 120
 ```
 
-All configuration is optional. By default the service auto-detects adapters
-and uses sensible defaults.
+The polling interval is configured per-device via the GUI slider (see above)
+and is not in the config file.  All other configuration is optional.  By
+default the service auto-detects adapters and uses sensible defaults.
 
 ## Service Management
 
