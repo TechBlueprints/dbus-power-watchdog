@@ -115,7 +115,7 @@ class TestClassifyDevice:
     # ── Gen2 (WD_ prefix) ───────────────────────────────────────────────
 
     @pytest.mark.parametrize("name,expected_type,expected_line", [
-        ("WD_E5_26ec4ae469a5", "E5", "single"),
+        ("WD_E5_1a2b3c4d5e6f", "E5", "single"),
         ("WD_E6_aabbccddeeff", "E6", "single"),
         ("WD_V5_112233445566", "V5", "single"),
         ("WD_V6_deadbeef1234", "V6", "single"),
@@ -129,7 +129,7 @@ class TestClassifyDevice:
         assert result.mac == ""  # caller fills this in
 
     @pytest.mark.parametrize("name,expected_type,expected_line", [
-        ("WD_E7_26ec4ae469a5", "E7", "double"),
+        ("WD_E7_1a2b3c4d5e6f", "E7", "double"),
         ("WD_E8_aabbccddeeff", "E8", "double"),
         ("WD_E9_112233445566", "E9", "double"),
         ("WD_V7_deadbeef1234", "V7", "double"),

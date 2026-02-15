@@ -85,7 +85,7 @@ The service scans BLE for two naming patterns:
 
 | Generation | BLE Name Pattern | Example |
 |------------|-----------------|---------|
-| Gen2 (WiFi+BT) | `WD_{type}_{serial}` | `WD_E7_26ec4ae469a5` |
+| Gen2 (WiFi+BT) | `WD_{type}_{serial}` | `WD_E7_aabbccddeeff` |
 | Gen1 (BT-only) | `PM{S\|D}...` (19 chars) | `PMD...` (50A), `PMS...` (30A) |
 
 Scanning handles BLE InProgress errors with retry and adapter rotation.
@@ -152,7 +152,7 @@ Each slider step is 100ms:
 | 100 | 10000ms | Slowest; lowest BLE overhead |
 
 The switch name label updates in real-time to show the current interval,
-e.g. `WD_E7_26ec4ae469a5 (5000ms)`.
+e.g. `WD_E7_aabbccddeeff (5000ms)`.
 
 Slider changes are **debounced by 5 seconds** before taking effect.  This
 prevents rapid GUI dragging from causing excessive BLE rescheduling.  The

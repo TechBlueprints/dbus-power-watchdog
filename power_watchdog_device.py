@@ -422,7 +422,7 @@ def parse_args():
     )
     parser.add_argument(
         "--mac", required=True,
-        help="MAC address of the Power Watchdog (e.g., 24:EC:4A:E4:69:A5)"
+        help="MAC address of the Power Watchdog (e.g., AA:BB:CC:DD:EE:FF)"
     )
     parser.add_argument(
         "--adapter", default="",

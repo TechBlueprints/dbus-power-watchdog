@@ -143,8 +143,8 @@ class WatchdogData:
 @dataclass
 class DiscoveredDevice:
     """A Power Watchdog device found during BLE scanning."""
-    mac: str               # MAC address (e.g., "24:EC:4A:E4:69:A5")
-    name: str              # BLE advertised name (e.g., "WD_E7_26ec4ae469a5")
+    mac: str               # MAC address (e.g., "AA:BB:CC:DD:EE:FF")
+    name: str              # BLE advertised name (e.g., "WD_E7_aabbccddeeff")
     generation: int = 0    # 1 = gen1 (BT-only), 2 = gen2 (WiFi+BT)
     device_type: str = ""  # e.g., "E7" for gen2, "PMD" for gen1 50A
     line_type: str = ""    # "single" (30A) or "double" (50A)

@@ -262,11 +262,11 @@ class TestMacIdToAddress:
         from power_watchdog_ble import DiscoveredDevice
 
         stub = self._make_service_stub({
-            "24ec4ae469a5": DiscoveredDevice(
-                mac="24:EC:4A:E4:69:A5", name="WD_E7_24ec4ae469a5"
+            "aabbccddeeff": DiscoveredDevice(
+                mac="AA:BB:CC:DD:EE:FF", name="WD_E7_aabbccddeeff"
             ),
         })
-        assert stub._mac_id_to_address("24ec4ae469a5") == "24:EC:4A:E4:69:A5"
+        assert stub._mac_id_to_address("aabbccddeeff") == "AA:BB:CC:DD:EE:FF"
 
     def test_unknown_device_reconstructs(self):
         stub = self._make_service_stub()
