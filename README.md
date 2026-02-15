@@ -32,6 +32,10 @@ models, including gen1 (BT-only) and gen2 (WiFi+BT) hardware.
 
 ![Power Watchdog device detail](images/cerbo-device-detail.png)
 
+**Switch panel** — Discovery toggle, system setting overrides, and the per-device polling interval slider (shown at 500ms):
+
+![Power Watchdog switch panel](images/cerbo-toggles.png)
+
 ## Architecture
 
 ```
