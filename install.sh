@@ -91,13 +91,31 @@ else
 fi
 echo ""
 
-# Step 3: Run enable script
-echo "Step 3: Enabling service..."
+# Step 3: Initialize velib_python submodule
+echo "Step 3: Setting up velib_python..."
+cd "$INSTALL_DIR"
+if [ ! -f ext/velib_python/vedbus.py ]; then
+    git submodule update --init --recursive 2>/dev/null || {
+        echo "Submodule init failed, cloning velib_python directly..."
+        mkdir -p ext
+        if [ -d ext/velib_python ]; then
+            rm -rf ext/velib_python
+        fi
+        git clone https://github.com/victronenergy/velib_python.git ext/velib_python
+    }
+    echo "velib_python ready"
+else
+    echo "velib_python already present"
+fi
+echo ""
+
+# Step 4: Run enable script
+echo "Step 4: Enabling service..."
 bash "$INSTALL_DIR/enable.sh"
 echo ""
 
-# Step 4: Start or restart service
-echo "Step 4: Starting service..."
+# Step 5: Start or restart service
+echo "Step 5: Starting service..."
 if svstat "/service/$SERVICE_NAME" 2>/dev/null | grep -q "up"; then
     if [ "$NEEDS_RESTART" = true ]; then
         echo "Restarting service to apply updates..."
