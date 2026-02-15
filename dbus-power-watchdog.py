@@ -193,6 +193,61 @@ class PowerWatchdogDiscoveryService:
         self._dbusservice.add_path("%s/Settings/ShowUIControl" % discovery_path, 1, writeable=True)
         self._dbusservice.add_path("%s/Settings/PowerOnState" % discovery_path, 1)
 
+        # ── HasAcInLoads toggle switch ───────────────────────────────────
+        # When ON, tells Venus OS that there are loads between the grid
+        # meter and the inverter AC input, populating the "AC Loads" card
+        # on both the local GUI and VRM portal.
+        ac_loads_path = "/SwitchableOutput/relay_has_ac_in_loads"
+        self._dbusservice.add_path(
+            "%s/Name" % ac_loads_path, "* Report AC Input Loads"
+        )
+        self._dbusservice.add_path("%s/Type" % ac_loads_path, 1)  # toggle
+        self._dbusservice.add_path(
+            "%s/State" % ac_loads_path, 0,
+            writeable=True,
+            onchangecallback=self._on_has_ac_in_loads_changed,
+        )
+        self._dbusservice.add_path("%s/Status" % ac_loads_path, 0x00)
+        self._dbusservice.add_path("%s/Current" % ac_loads_path, 0)
+
+        # Settings paths for the HasAcInLoads toggle
+        self._dbusservice.add_path("%s/Settings/CustomName" % ac_loads_path, "", writeable=True)
+        self._dbusservice.add_path("%s/Settings/Type" % ac_loads_path, 1, writeable=True)
+        self._dbusservice.add_path("%s/Settings/ValidTypes" % ac_loads_path, 2)
+        self._dbusservice.add_path("%s/Settings/Function" % ac_loads_path, 2, writeable=True)
+        self._dbusservice.add_path("%s/Settings/ValidFunctions" % ac_loads_path, 4)
+        self._dbusservice.add_path("%s/Settings/Group" % ac_loads_path, "", writeable=True)
+        self._dbusservice.add_path("%s/Settings/ShowUIControl" % ac_loads_path, 1, writeable=True)
+        self._dbusservice.add_path("%s/Settings/PowerOnState" % ac_loads_path, 1)
+
+        # ── Inverter Metering toggle switch ──────────────────────────────
+        # When ON, tells Venus OS to use inverter-internal metering instead
+        # of the external grid meter for system calculations.  This changes
+        # VRM's layout to show DC Loads, but means the Power Watchdog
+        # readings are display-only rather than authoritative.
+        inv_meter_path = "/SwitchableOutput/relay_inverter_metering"
+        self._dbusservice.add_path(
+            "%s/Name" % inv_meter_path, "* Use Inverter Metering (not grid meter)"
+        )
+        self._dbusservice.add_path("%s/Type" % inv_meter_path, 1)  # toggle
+        self._dbusservice.add_path(
+            "%s/State" % inv_meter_path, 0,
+            writeable=True,
+            onchangecallback=self._on_run_without_grid_meter_changed,
+        )
+        self._dbusservice.add_path("%s/Status" % inv_meter_path, 0x00)
+        self._dbusservice.add_path("%s/Current" % inv_meter_path, 0)
+
+        # Settings paths for the Inverter Metering toggle
+        self._dbusservice.add_path("%s/Settings/CustomName" % inv_meter_path, "", writeable=True)
+        self._dbusservice.add_path("%s/Settings/Type" % inv_meter_path, 1, writeable=True)
+        self._dbusservice.add_path("%s/Settings/ValidTypes" % inv_meter_path, 2)
+        self._dbusservice.add_path("%s/Settings/Function" % inv_meter_path, 2, writeable=True)
+        self._dbusservice.add_path("%s/Settings/ValidFunctions" % inv_meter_path, 4)
+        self._dbusservice.add_path("%s/Settings/Group" % inv_meter_path, "", writeable=True)
+        self._dbusservice.add_path("%s/Settings/ShowUIControl" % inv_meter_path, 1, writeable=True)
+        self._dbusservice.add_path("%s/Settings/PowerOnState" % inv_meter_path, 1)
+
         # ── Persistent settings ─────────────────────────────────────────
         settings = {
             "ClassAndVrmInstance": [
@@ -207,6 +262,18 @@ class PowerWatchdogDiscoveryService:
                 0,
                 1,
             ],
+            "HasAcInLoads": [
+                "/Settings/Devices/power_watchdog/HasAcInLoads",
+                1,  # Default: ON — report loads between grid meter and inverter
+                0,
+                1,
+            ],
+            "RunWithoutGridMeter": [
+                "/Settings/Devices/power_watchdog/RunWithoutGridMeter",
+                0,  # Default: OFF — use Power Watchdog as authoritative grid meter
+                0,
+                1,
+            ],
         }
         self._settings = SettingsDevice(
             self._bus,
@@ -218,6 +285,16 @@ class PowerWatchdogDiscoveryService:
         # Register service on D-Bus
         self._dbusservice.register()
         logger.info("Registered discovery service on D-Bus")
+
+        # Restore HasAcInLoads toggle and apply to Venus OS system setting
+        has_ac_in_loads = int(self._settings["HasAcInLoads"])
+        self._dbusservice["/SwitchableOutput/relay_has_ac_in_loads/State"] = has_ac_in_loads
+        self._apply_has_ac_in_loads(has_ac_in_loads)
+
+        # Restore RunWithoutGridMeter toggle and apply to Venus OS system setting
+        run_without = int(self._settings["RunWithoutGridMeter"])
+        self._dbusservice["/SwitchableOutput/relay_inverter_metering/State"] = run_without
+        self._apply_run_without_grid_meter(run_without)
 
         # Restore previously discovered devices from settings
         self._restore_devices_from_settings()
@@ -234,6 +311,55 @@ class PowerWatchdogDiscoveryService:
 
         # Periodic health check for child processes (every 30s)
         GLib.timeout_add_seconds(30, self._health_check)
+
+    # ── System setting synchronisation ─────────────────────────────────────
+
+    def _apply_has_ac_in_loads(self, value: int):
+        """Write HasAcInLoads to the Venus OS system setting.
+
+        When an external grid meter is present, setting HasAcInLoads = 1
+        tells dbus-systemcalc-py to calculate loads between the meter and
+        the inverter AC input.  This populates the "AC Loads" widget on
+        both the local GUI and VRM.
+        """
+        try:
+            system_bus = dbus.SystemBus()
+            system_bus.call_blocking(
+                "com.victronenergy.settings",
+                "/Settings/SystemSetup/HasAcInLoads",
+                "com.victronenergy.BusItem",
+                "SetValue",
+                "v",
+                [dbus.Int32(value)],
+                timeout=5,
+            )
+            logger.info("System HasAcInLoads set to %d", value)
+        except Exception:
+            logger.exception("Failed to set HasAcInLoads on system bus")
+
+    def _apply_run_without_grid_meter(self, value: int):
+        """Write RunWithoutGridMeter to the Venus OS system setting.
+
+        When 0 (default), the system uses the Power Watchdog as the
+        authoritative external grid meter.  When 1, the system uses
+        the inverter's internal metering instead; the Power Watchdog
+        data is still published but treated as display-only.  Setting
+        this to 1 also changes VRM's layout to show the DC Loads tile.
+        """
+        try:
+            system_bus = dbus.SystemBus()
+            system_bus.call_blocking(
+                "com.victronenergy.settings",
+                "/Settings/CGwacs/RunWithoutGridMeter",
+                "com.victronenergy.BusItem",
+                "SetValue",
+                "v",
+                [dbus.Int32(value)],
+                timeout=5,
+            )
+            logger.info("System RunWithoutGridMeter set to %d", value)
+        except Exception:
+            logger.exception("Failed to set RunWithoutGridMeter on system bus")
 
     # ── Adapter detection ───────────────────────────────────────────────────
 
@@ -256,6 +382,26 @@ class PowerWatchdogDiscoveryService:
         if not adapters:
             adapters = [""]  # default adapter
         return adapters
+
+    # ── HasAcInLoads toggle callback ────────────────────────────────────────
+
+    def _on_has_ac_in_loads_changed(self, path, value):
+        """Called when the HasAcInLoads toggle is changed in the GUI."""
+        enabled = bool(int(value) if isinstance(value, str) else value)
+        logger.info("HasAcInLoads %s by user", "enabled" if enabled else "disabled")
+        self._settings["HasAcInLoads"] = 1 if enabled else 0
+        self._apply_has_ac_in_loads(1 if enabled else 0)
+        return True
+
+    # ── RunWithoutGridMeter toggle callback ──────────────────────────────────
+
+    def _on_run_without_grid_meter_changed(self, path, value):
+        """Called when the Inverter Metering toggle is changed in the GUI."""
+        enabled = bool(int(value) if isinstance(value, str) else value)
+        logger.info("RunWithoutGridMeter %s by user", "enabled" if enabled else "disabled")
+        self._settings["RunWithoutGridMeter"] = 1 if enabled else 0
+        self._apply_run_without_grid_meter(1 if enabled else 0)
+        return True
 
     # ── Discovery toggle callbacks ──────────────────────────────────────────
 
@@ -285,6 +431,10 @@ class PowerWatchdogDiscoveryService:
     def _on_settings_changed(self, setting, old_value, new_value):
         """Callback when a setting changes in com.victronenergy.settings."""
         logger.debug("Setting changed: %s = %s", setting, new_value)
+        if setting == "HasAcInLoads":
+            self._apply_has_ac_in_loads(int(new_value))
+        elif setting == "RunWithoutGridMeter":
+            self._apply_run_without_grid_meter(int(new_value))
 
     # ── BLE Scanning ────────────────────────────────────────────────────────
 

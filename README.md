@@ -24,6 +24,8 @@ dbus-power-watchdog.py          (discovery / management process)
   ├─ Registers as com.victronenergy.switch.power_watchdog
   ├─ Discovery toggle in Venus OS switches pane
   ├─ Per-device enable/disable toggles
+  ├─ "Report AC Input Loads" system toggle (HasAcInLoads)
+  ├─ "Use Inverter Metering" system toggle (RunWithoutGridMeter)
   └─ Spawns child processes for enabled devices:
       │
       ├─ power_watchdog_device.py --mac AA:BB:CC:DD:EE:FF
@@ -102,6 +104,78 @@ bash enable.sh
 5. Discovered Power Watchdog devices will appear as toggles
 6. Enable a device to start reading AC data
 7. The device will appear as a grid meter (or genset/pvinverter after role change)
+
+## System Settings (GUI Toggles)
+
+The Power Watchdog Manager pane exposes two additional system-level toggles.
+These control Venus OS settings that affect how the Cerbo GX, VRM portal,
+and `dbus-systemcalc-py` interpret your system topology.
+
+### Report AC Input Loads (`HasAcInLoads`)
+
+**D-Bus setting:** `/Settings/SystemSetup/HasAcInLoads`
+**Default:** ON (1)
+
+Tells Venus OS that there are loads wired between the grid meter and the
+inverter's AC input.  When enabled, `dbus-systemcalc-py` calculates
+`/Ac/ConsumptionOnInput` as the difference between the grid meter reading
+and the inverter AC-in reading, and publishes it separately from
+`/Ac/ConsumptionOnOutput`.
+
+| Setting | Cerbo GUI | VRM Portal |
+|---------|-----------|------------|
+| **ON** | Shows separate "AC Loads" (input-side) and "Essential Loads" (output-side) tiles | "AC Loads" tile shows input-side consumption instead of "-" |
+| **OFF** | Shows a single "AC Loads" tile using total `/Ac/Consumption` | "AC Loads" tile shows "-" (blank) |
+
+**Recommendation:** Leave ON if you have any loads between the Power Watchdog
+and the inverter (e.g., shore power outlets, HVAC).  Turn OFF for the
+simplest display if the Power Watchdog is wired directly to the inverter
+with nothing in between.
+
+### Use Inverter Metering (`RunWithoutGridMeter`)
+
+**D-Bus setting:** `/Settings/CGwacs/RunWithoutGridMeter`
+**Default:** OFF (0)
+
+Controls whether Venus OS uses the external grid meter (Power Watchdog) or
+the inverter's internal metering for system calculations.
+
+| Setting | Behavior | VRM Portal |
+|---------|----------|------------|
+| **OFF** (default) | Power Watchdog is the authoritative grid meter; system calculations use its readings | Shows "Essential Loads" / "Non-Essential Loads" layout; **DC Loads tile is hidden** (known VRM limitation) |
+| **ON** | Inverter internal metering is authoritative; Power Watchdog readings are display-only | Shows standard layout with "DC Loads" tile visible; Power Watchdog data still appears but is not used for system calculations |
+
+**Recommendation:** Leave OFF for accurate grid metering.  Only turn ON if
+you specifically need DC Loads visible on the VRM portal and accept that
+the Power Watchdog's readings become informational rather than
+authoritative.
+
+### Known VRM Portal Limitation
+
+The VRM portal (`vrm.victronenergy.com`) is a closed-source application with
+rendering logic that differs from the local Cerbo GUI and the
+`venus-html5-app`.
+
+When an external grid meter is active (`RunWithoutGridMeter = 0`), VRM uses
+an ESS-style layout that:
+
+- Hides the **DC Loads** tile entirely (even though `/Dc/System/Power` is
+  correctly published on D-Bus)
+- Splits consumption into **Essential Loads** (AC output) and
+  **Non-Essential Loads** (AC input) instead of showing a single AC Loads
+  value
+
+This is a [known, long-standing VRM limitation](https://github.com/victronenergy/venus/issues/1263)
+based on an old design assumption that systems with external grid meters
+do not have DC loads.  It affects all external grid meter drivers, including
+Victron-maintained ones like `dbus-cgwacs` and `dbus-shelly`.
+
+The local Cerbo GUI and `venus-html5-app` (used on MFDs) render correctly
+in all configurations -- they show DC Loads whenever `/Dc/System/Power` has
+a value, and use `/Ac/Consumption` for AC Loads without the ESS split.
+
+No D-Bus workaround exists; the fix requires a VRM portal UI change by
+Victron Energy.
 
 ## Configuration
 
