@@ -17,6 +17,16 @@ meter.  Settings (role, custom name, position) are persisted via
 Supports both 30A (single-line) and 50A (dual-line L1+L2) Power Watchdog
 models, including gen1 (BT-only) and gen2 (WiFi+BT) hardware.
 
+### Cerbo GX Screenshots
+
+**Overview dashboard** — Power Watchdog reporting as the grid meter (178W across L1+L2), with AC Loads, Essential Loads, DC Loads, battery, and inverter status all visible:
+
+![Cerbo GX overview dashboard](images/cerbo-overview.png)
+
+**Power Watchdog device detail** — per-phase AC voltage, current, power, and cumulative energy totals:
+
+![Power Watchdog device detail](images/cerbo-device-detail.png)
+
 ## Architecture
 
 ```
