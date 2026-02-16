@@ -48,7 +48,7 @@ DLReport body (cmd=1):
       [33]    status
 
 Connection sequence:
-  1. Scan and connect
+  1. Scan and connect (via bleak-connection-manager)
   2. Subscribe to notifications on 0000ff01
   3. Request MTU 230
   4. Send handshake: "!%!%,protocol,open,"
@@ -57,19 +57,25 @@ Connection sequence:
 
 import asyncio
 import logging
-import os
 import struct
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
 
-# Use bleak from dbus-serialbattery's vendored copy if not installed system-wide
-_serialbattery_ext = "/data/apps/dbus-serialbattery/ext"
-if os.path.isdir(_serialbattery_ext) and _serialbattery_ext not in sys.path:
-    sys.path.insert(0, _serialbattery_ext)
+from bleak import BleakClient, BleakError
+from bleak.backends.device import BLEDevice
 
-from bleak import BleakClient, BleakScanner, BleakError  # noqa: E402
+from bleak_connection_manager import (
+    ConnectionWatchdog,
+    EscalationConfig,
+    EscalationPolicy,
+    LockConfig,
+    ScanLockConfig,
+    establish_connection,
+    managed_discover,
+    managed_find_device,
+    validate_gatt_services,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +89,6 @@ GEN2_PREFIX = "WD_"
 # Gen1 (BT-only) devices advertise as "PM{S|D}..." (19 or 27 chars)
 # S = single/30A, D = double/50A
 GEN1_PREFIX = "PM"
-
-# Maximum retries when BLE scanner reports InProgress
-SCAN_MAX_RETRIES = 3
-SCAN_RETRY_DELAY = 5.0  # seconds between retries
 
 # ── Protocol constants ──────────────────────────────────────────────────────
 
@@ -110,6 +112,11 @@ CMD_ALARM = 14
 
 # DLData block size (per line)
 DL_DATA_SIZE = 34
+
+# Notification watchdog: force reconnect if no BLE notifications arrive
+# within this window.  Power Watchdog sends updates ~every 30s, so 2 minutes
+# of silence almost certainly means the radio link is dead.
+NOTIFICATION_WATCHDOG_TIMEOUT = 120.0  # seconds
 
 
 # ── Data model ──────────────────────────────────────────────────────────────
@@ -202,34 +209,40 @@ def classify_device(name: str) -> DiscoveredDevice | None:
     return None
 
 
-async def _scan_once(
-    adapter: str = "",
+async def scan_for_devices(
     timeout: float = 15.0,
+    scan_lock_config: ScanLockConfig | None = None,
 ) -> list[DiscoveredDevice]:
-    """Perform a single BLE scan and return discovered Power Watchdog devices.
+    """Scan for Power Watchdog BLE devices.
+
+    Uses bleak-connection-manager's managed_discover for automatic
+    adapter rotation, scan locking, and InProgress retry.
 
     Args:
-        adapter: Bluetooth adapter to use (e.g., "hci0"). Empty for default.
-        timeout: Scan timeout in seconds.
+        timeout: Scan timeout per attempt in seconds.
+        scan_lock_config: Cross-process scan lock config.  If None,
+            a default enabled config is used.
 
     Returns:
-        List of DiscoveredDevice instances found during this scan.
-
-    Raises:
-        BleakError: If the scanner reports an error (e.g., InProgress).
+        List of all unique DiscoveredDevice instances found.
     """
-    kwargs = {}
-    if adapter:
-        kwargs["adapter"] = adapter
+    if scan_lock_config is None:
+        scan_lock_config = ScanLockConfig(enabled=True)
 
-    devices = await BleakScanner.discover(timeout=timeout, **kwargs)
+    devices = await managed_discover(
+        timeout=timeout,
+        scan_lock_config=scan_lock_config,
+    )
+
     found: list[DiscoveredDevice] = []
+    seen_macs: set[str] = set()
 
     for device in devices:
         name = device.name or ""
         classified = classify_device(name)
-        if classified is not None:
+        if classified is not None and device.address not in seen_macs:
             classified.mac = device.address
+            seen_macs.add(device.address)
             found.append(classified)
             logger.info(
                 "Discovered Power Watchdog: %s (%s) gen%d %s %s",
@@ -237,102 +250,42 @@ async def _scan_once(
                 classified.device_type, classified.line_type,
             )
 
-    return found
-
-
-async def scan_for_devices(
-    adapters: list[str] | None = None,
-    timeout: float = 15.0,
-) -> list[DiscoveredDevice]:
-    """Scan for Power Watchdog BLE devices with retry and adapter rotation.
-
-    Handles BLE InProgress errors by retrying with exponential backoff.
-    If multiple adapters are specified, rotates through them on failure.
-
-    Args:
-        adapters: List of adapters to try (e.g., ["hci0", "hci1"]).
-                  None or empty list means use the default adapter.
-        timeout: Scan timeout per attempt in seconds.
-
-    Returns:
-        List of all unique DiscoveredDevice instances found.
-    """
-    if not adapters:
-        adapters = [""]  # empty string = default adapter
-
-    seen_macs: set[str] = set()
-    all_found: list[DiscoveredDevice] = []
-
-    for adapter in adapters:
-        adapter_label = adapter or "default"
-        retries = 0
-        delay = SCAN_RETRY_DELAY
-
-        while retries < SCAN_MAX_RETRIES:
-            try:
-                logger.info(
-                    "Scanning for Power Watchdog devices on %s (attempt %d/%d)...",
-                    adapter_label, retries + 1, SCAN_MAX_RETRIES,
-                )
-                found = await _scan_once(adapter=adapter, timeout=timeout)
-                for dev in found:
-                    if dev.mac not in seen_macs:
-                        seen_macs.add(dev.mac)
-                        all_found.append(dev)
-                # Successful scan -- break retry loop for this adapter
-                break
-
-            except BleakError as e:
-                err_str = str(e).lower()
-                if "inprogress" in err_str or "in progress" in err_str:
-                    retries += 1
-                    if retries < SCAN_MAX_RETRIES:
-                        logger.warning(
-                            "BLE scan InProgress on %s, retrying in %.0fs (%d/%d)",
-                            adapter_label, delay, retries, SCAN_MAX_RETRIES,
-                        )
-                        await asyncio.sleep(delay)
-                        delay = min(delay * 1.5, 30.0)
-                    else:
-                        logger.warning(
-                            "BLE scan InProgress on %s after %d retries, "
-                            "moving to next adapter",
-                            adapter_label, SCAN_MAX_RETRIES,
-                        )
-                else:
-                    logger.error("BLE scan error on %s: %s", adapter_label, e)
-                    break  # non-retryable error
-
-            except Exception:
-                logger.exception("Unexpected error scanning on %s", adapter_label)
-                break
-
-    if all_found:
+    if found:
         logger.info(
-            "Discovery complete: found %d Power Watchdog device(s)", len(all_found)
+            "Discovery complete: found %d Power Watchdog device(s)", len(found)
         )
     else:
         logger.info("Discovery complete: no Power Watchdog devices found")
 
-    return all_found
+    return found
 
 
 # ── BLE client ──────────────────────────────────────────────────────────────
 
 class PowerWatchdogBLE:
-    """BLE client that runs in a daemon thread and exposes data to the main thread."""
+    """BLE client that runs in a daemon thread and exposes data to the main thread.
+
+    Uses bleak-connection-manager for all BLE operations:
+    - managed_find_device for scanning (with scan lock + adapter rotation)
+    - establish_connection for connecting (with connect lock + all workarounds)
+    - ConnectionWatchdog for detecting dead connections
+    """
 
     def __init__(
         self,
         address: str,
-        adapter: str = "",
         reconnect_delay: float = 10.0,
         reconnect_max_delay: float = 120.0,
+        lock_config: LockConfig | None = None,
+        scan_lock_config: ScanLockConfig | None = None,
     ):
         self.address = address
-        self.adapter = adapter
         self.reconnect_delay = reconnect_delay
         self.reconnect_max_delay = reconnect_max_delay
+
+        # BCM lock configs — default to enabled
+        self._lock_config = lock_config or LockConfig(enabled=True)
+        self._scan_lock_config = scan_lock_config or ScanLockConfig(enabled=True)
 
         self._data = WatchdogData()
         self._data_lock = threading.Lock()
@@ -340,8 +293,11 @@ class PowerWatchdogBLE:
         self._running = True
 
         # asyncio event loop reference (set by daemon thread)
-        self._loop = None
-        self._sleep_task = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._sleep_task: asyncio.Task | None = None
+
+        # Connection watchdog (set when connected)
+        self._watchdog: ConnectionWatchdog | None = None
 
         # Packet reassembly buffer (notifications may be fragmented)
         self._rx_buffer = bytearray()
@@ -400,15 +356,16 @@ class PowerWatchdogBLE:
             return
         self._running = False
 
+        # Stop the watchdog if active
+        if self._watchdog is not None:
+            self._watchdog.stop()
+
         # If there's a running asyncio loop, cancel the sleep so the
         # disconnect happens immediately rather than waiting up to 1s.
         if self._loop is not None:
             self._loop.call_soon_threadsafe(self._cancel_sleep)
 
         # Wait for the daemon thread to finish its disconnect.
-        # Without this, the process exits and the daemon thread is killed
-        # before BleakClient's context manager can call disconnect(),
-        # leaving BlueZ with a stale connection.
         self._thread.join(timeout=timeout)
         if self._thread.is_alive():
             logger.warning(
@@ -438,113 +395,173 @@ class PowerWatchdogBLE:
                 self._loop = None
 
     async def _async_main(self):
-        """Connect, subscribe, handshake, and stay connected."""
+        """Connect, subscribe, handshake, and stay connected.
+
+        Uses bleak-connection-manager for all BLE operations:
+        1. managed_find_device — scan with lock + adapter rotation
+        2. establish_connection — connect with all workarounds
+        3. ConnectionWatchdog — detect dead radio links
+        """
         delay = self.reconnect_delay
+        escalation = EscalationPolicy([], config=EscalationConfig(reset_adapter=True))
 
         while self._running:
+            client: BleakClient | None = None
+            device: BLEDevice | None = None
+
             try:
-                logger.info("Scanning for Power Watchdog %s...", self.address)
-
-                kwargs = {}
-                if self.adapter:
-                    kwargs["adapter"] = self.adapter
-
-                device = await BleakScanner.find_device_by_address(
-                    self.address, timeout=20.0, **kwargs
+                # Step 1: Find the device via managed scan
+                logger.info(
+                    "Scanning for Power Watchdog %s...", self.address,
                 )
+
+                device = await managed_find_device(
+                    self.address,
+                    timeout=20.0,
+                    max_attempts=3,
+                    scan_lock_config=self._scan_lock_config,
+                )
+
                 if device is None:
                     logger.warning(
                         "Power Watchdog %s not found, retrying in %.0fs",
                         self.address, delay,
                     )
-                    try:
-                        self._sleep_task = asyncio.ensure_future(
-                            asyncio.sleep(delay)
-                        )
-                        await self._sleep_task
-                    except asyncio.CancelledError:
-                        break
-                    finally:
-                        self._sleep_task = None
+                    await self._interruptible_sleep(delay)
                     delay = min(delay * 1.5, self.reconnect_max_delay)
                     continue
 
-                logger.info("Connecting to Power Watchdog %s...", self.address)
+                # Step 2: Connect via BCM (handles phantom cleanup,
+                # adapter rotation, InProgress, GATT validation, etc.)
+                logger.info(
+                    "Connecting to Power Watchdog %s...", self.address,
+                )
 
-                async with BleakClient(device, **kwargs) as client:
-                    logger.info(
-                        "Connected to Power Watchdog %s (MTU: %d)",
-                        self.address,
-                        client.mtu_size,
-                    )
-                    self._connected = True
-                    self._rx_buffer.clear()
-                    delay = self.reconnect_delay  # reset backoff
+                client = await establish_connection(
+                    BleakClient,
+                    device,
+                    "Power Watchdog %s" % self.address,
+                    max_attempts=4,
+                    close_inactive_connections=True,
+                    try_direct_first=True,
+                    validate_connection=validate_gatt_services,
+                    lock_config=self._lock_config,
+                    escalation_policy=escalation,
+                )
 
-                    # Log discovered services for debugging
-                    for svc in client.services:
-                        logger.debug("Service: %s", svc.uuid)
-                        for char in svc.characteristics:
-                            logger.debug(
-                                "  Char: %s [%s]",
-                                char.uuid,
-                                ",".join(char.properties),
-                            )
+                # Step 3: Connected — set up notifications and handshake
+                logger.info(
+                    "Connected to Power Watchdog %s (MTU: %d)",
+                    self.address, client.mtu_size,
+                )
+                self._connected = True
+                self._rx_buffer.clear()
+                delay = self.reconnect_delay  # reset backoff
 
-                    # Subscribe to notifications
-                    logger.info(
-                        "Subscribing to notifications on %s",
-                        CHARACTERISTIC_UUID,
-                    )
-                    await client.start_notify(
+                # Log discovered services for debugging
+                for svc in client.services:
+                    logger.debug("Service: %s", svc.uuid)
+                    for char in svc.characteristics:
+                        logger.debug(
+                            "  Char: %s [%s]",
+                            char.uuid,
+                            ",".join(char.properties),
+                        )
+
+                # Subscribe to notifications
+                logger.info(
+                    "Subscribing to notifications on %s",
+                    CHARACTERISTIC_UUID,
+                )
+                await asyncio.wait_for(
+                    client.start_notify(
                         CHARACTERISTIC_UUID, self._notification_handler
-                    )
+                    ),
+                    timeout=5.0,
+                )
 
-                    # Send handshake to start data flow
-                    logger.info("Sending handshake...")
-                    await client.write_gatt_char(
-                        CHARACTERISTIC_UUID, HANDSHAKE_PAYLOAD, response=True
-                    )
-                    logger.info("Handshake sent, waiting for data...")
+                # Send handshake to start data flow
+                logger.info("Sending handshake...")
+                await client.write_gatt_char(
+                    CHARACTERISTIC_UUID, HANDSHAKE_PAYLOAD, response=True
+                )
+                logger.info("Handshake sent, waiting for data...")
 
-                    # Stay connected while client is alive
-                    while client.is_connected and self._running:
-                        try:
-                            self._sleep_task = asyncio.ensure_future(
-                                asyncio.sleep(1.0)
-                            )
-                            await self._sleep_task
-                        except asyncio.CancelledError:
-                            break
-                        finally:
-                            self._sleep_task = None
+                # Step 4: Start connection watchdog
+                self._watchdog = ConnectionWatchdog(
+                    timeout=NOTIFICATION_WATCHDOG_TIMEOUT,
+                    on_timeout=self._on_watchdog_timeout,
+                    client=client,
+                    device=device,
+                )
+                self._watchdog.start()
 
-                    self._connected = False
-                    logger.info("Disconnecting from Power Watchdog...")
-                    # BleakClient context manager calls disconnect() here
+                # Step 5: Stay connected while client is alive
+                while client.is_connected and self._running:
+                    await self._interruptible_sleep(1.0)
 
-                logger.warning("Power Watchdog disconnected")
+                self._connected = False
+                logger.info(
+                    "Disconnecting from Power Watchdog %s...", self.address
+                )
 
             except Exception:
                 self._connected = False
                 logger.exception(
-                    "BLE connection error, retrying in %.0fs", delay,
+                    "BLE connection error for %s, retrying in %.0fs",
+                    self.address, delay,
                 )
-                try:
-                    self._sleep_task = asyncio.ensure_future(
-                        asyncio.sleep(delay)
-                    )
-                    await self._sleep_task
-                except asyncio.CancelledError:
-                    pass
-                finally:
-                    self._sleep_task = None
-                delay = min(delay * 1.5, self.reconnect_max_delay)
+
+            finally:
+                # Stop watchdog
+                if self._watchdog is not None:
+                    self._watchdog.stop()
+                    self._watchdog = None
+
+                # Explicit disconnect with timeout
+                if client is not None:
+                    try:
+                        await asyncio.wait_for(
+                            client.disconnect(), timeout=5.0
+                        )
+                    except Exception:
+                        pass
+                    client = None
+
+            if not self._running:
+                break
+
+            logger.warning("Power Watchdog %s disconnected", self.address)
+            await self._interruptible_sleep(delay)
+            delay = min(delay * 1.5, self.reconnect_max_delay)
+
+    def _on_watchdog_timeout(self):
+        """Called by ConnectionWatchdog when no notifications for 2 minutes."""
+        logger.warning(
+            "BLE watchdog: no notifications for %.0fs from %s, "
+            "forcing reconnect",
+            NOTIFICATION_WATCHDOG_TIMEOUT, self.address,
+        )
+        self._connected = False
+
+    async def _interruptible_sleep(self, seconds: float):
+        """Sleep that can be cancelled by stop()."""
+        try:
+            self._sleep_task = asyncio.ensure_future(asyncio.sleep(seconds))
+            await self._sleep_task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._sleep_task = None
 
     # ── Notification handling and packet parsing ────────────────────────────
 
     def _notification_handler(self, _sender, data: bytearray):
         """Handle incoming BLE notification: buffer and parse framed packets."""
+        # Feed the connection watchdog
+        if self._watchdog is not None:
+            self._watchdog.notify_activity()
+
         self._rx_buffer.extend(data)
 
         # Safety: prevent unbounded buffer growth

@@ -47,9 +47,19 @@ _serialbattery_ext = "/data/apps/dbus-serialbattery/ext"
 if os.path.isdir(_serialbattery_ext) and _serialbattery_ext not in sys.path:
     sys.path.insert(2, _serialbattery_ext)
 
+# bleak-connection-manager and bleak-retry-connector from local ext/ submodules
+_ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
+_bcm_src = os.path.join(_ext_dir, "bleak-connection-manager", "src")
+if os.path.isdir(_bcm_src) and _bcm_src not in sys.path:
+    sys.path.insert(0, _bcm_src)
+_brc_src = os.path.join(_ext_dir, "bleak-retry-connector", "src")
+if os.path.isdir(_brc_src) and _brc_src not in sys.path:
+    sys.path.insert(0, _brc_src)
+
 from vedbus import VeDbusService  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402
 
+from bleak_connection_manager import LockConfig, ScanLockConfig  # noqa: E402
 from power_watchdog_ble import PowerWatchdogBLE, WatchdogData  # noqa: E402
 
 VERSION = "0.6.0"
@@ -122,9 +132,10 @@ class PowerWatchdogDeviceService:
         # Start BLE client in daemon thread
         self._ble = PowerWatchdogBLE(
             address=self._mac_address,
-            adapter=adapter,
             reconnect_delay=reconnect_delay,
             reconnect_max_delay=reconnect_max_delay,
+            lock_config=LockConfig(enabled=True),
+            scan_lock_config=ScanLockConfig(enabled=True),
         )
 
         # D-Bus connection
