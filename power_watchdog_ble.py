@@ -403,7 +403,7 @@ class PowerWatchdogBLE:
         3. ConnectionWatchdog — detect dead radio links
         """
         delay = self.reconnect_delay
-        escalation = EscalationPolicy([], config=EscalationConfig(reset_adapter=True))
+        escalation = EscalationPolicy([], config=EscalationConfig(reset_adapter=False))
 
         while self._running:
             client: BleakClient | None = None
@@ -447,6 +447,7 @@ class PowerWatchdogBLE:
                     validate_connection=validate_gatt_services,
                     lock_config=self._lock_config,
                     escalation_policy=escalation,
+                    overall_timeout=300.0,
                 )
 
                 # Step 3: Connected — set up notifications and handshake
