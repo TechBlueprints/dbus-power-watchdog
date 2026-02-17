@@ -71,6 +71,7 @@ from bleak_connection_manager import (
     EscalationPolicy,
     LockConfig,
     ScanLockConfig,
+    discover_adapters,
     establish_connection,
     managed_discover,
     managed_find_device,
@@ -403,7 +404,8 @@ class PowerWatchdogBLE:
         3. ConnectionWatchdog — detect dead radio links
         """
         delay = self.reconnect_delay
-        escalation = EscalationPolicy([], config=EscalationConfig(reset_adapter=False))
+        adapters = discover_adapters()
+        escalation = EscalationPolicy(adapters, config=EscalationConfig(reset_adapter=False))
 
         while self._running:
             client: BleakClient | None = None
@@ -559,10 +561,6 @@ class PowerWatchdogBLE:
 
     def _notification_handler(self, _sender, data: bytearray):
         """Handle incoming BLE notification: buffer and parse framed packets."""
-        # Feed the connection watchdog
-        if self._watchdog is not None:
-            self._watchdog.notify_activity()
-
         self._rx_buffer.extend(data)
 
         # Safety: prevent unbounded buffer growth
@@ -623,6 +621,12 @@ class PowerWatchdogBLE:
         if tail != PACKET_TAIL:
             logger.debug("Bad packet tail 0x%04X (expected 0x%04X)", tail, PACKET_TAIL)
             return True  # consumed bytes, try next
+
+        # Valid packet — feed the connection watchdog.
+        # This is the ONLY place it gets fed, proving the device is
+        # sending real, framing-verified data.
+        if self._watchdog is not None:
+            self._watchdog.notify_activity()
 
         # Dispatch by command
         if cmd == CMD_DL_REPORT:
