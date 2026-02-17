@@ -272,6 +272,11 @@ class PowerWatchdogBLE:
     - ConnectionWatchdog for detecting dead connections
     """
 
+    # When the device is completely offline (not found during scan),
+    # retry at this fixed interval rather than using exponential backoff.
+    # The device may be unplugged and will come back at any time.
+    OFFLINE_POLL_INTERVAL = 300.0  # 5 minutes
+
     def __init__(
         self,
         address: str,
@@ -426,11 +431,14 @@ class PowerWatchdogBLE:
 
                 if device is None:
                     logger.warning(
-                        "Power Watchdog %s not found, retrying in %.0fs",
-                        self.address, delay,
+                        "Power Watchdog %s not found (offline?), "
+                        "retrying in %.0fs",
+                        self.address, self.OFFLINE_POLL_INTERVAL,
                     )
-                    await self._interruptible_sleep(delay)
-                    delay = min(delay * 1.5, self.reconnect_max_delay)
+                    await self._interruptible_sleep(self.OFFLINE_POLL_INTERVAL)
+                    # Don't escalate backoff for "device not found" — the
+                    # device may simply be unplugged and will reappear.
+                    # Keep delay at its current value for connection errors.
                     continue
 
                 # Step 2: Connect via BCM (handles phantom cleanup,
