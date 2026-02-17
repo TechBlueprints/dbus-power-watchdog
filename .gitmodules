@@ -6,4 +6,13 @@
 	url = https://github.com/TechBlueprints/bleak-connection-manager.git
 [submodule "ext/bleak-retry-connector"]
 	path = ext/bleak-retry-connector
-	url = https://github.com/TechBlueprints/bleak-retry-connector.git
+	url = https://github.com/Bluetooth-Devices/bleak-retry-connector.git
+[submodule "ext/bleak"]
+	path = ext/bleak
+	url = https://github.com/hbldh/bleak.git
+[submodule "ext/bluetooth-adapters"]
+	path = ext/bluetooth-adapters
+	url = https://github.com/Bluetooth-Devices/bluetooth-adapters.git
+[submodule "ext/aiooui"]
+	path = ext/aiooui
+	url = https://github.com/Bluetooth-Devices/aiooui.git

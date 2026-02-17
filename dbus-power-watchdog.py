@@ -48,21 +48,19 @@ from gi.repository import GLib
 from dbus.mainloop.glib import DBusGMainLoop
 
 # Add ext folders to sys.path
-sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"))
-
-# Use bleak from dbus-serialbattery's vendored copy if not installed system-wide
-_serialbattery_ext = "/data/apps/dbus-serialbattery/ext"
-if os.path.isdir(_serialbattery_ext) and _serialbattery_ext not in sys.path:
-    sys.path.insert(2, _serialbattery_ext)
-
-# bleak-connection-manager and bleak-retry-connector from local ext/ submodules
 _ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
-_bcm_src = os.path.join(_ext_dir, "bleak-connection-manager", "src")
-if os.path.isdir(_bcm_src) and _bcm_src not in sys.path:
-    sys.path.insert(0, _bcm_src)
-_brc_src = os.path.join(_ext_dir, "bleak-retry-connector", "src")
-if os.path.isdir(_brc_src) and _brc_src not in sys.path:
-    sys.path.insert(0, _brc_src)
+sys.path.insert(1, os.path.join(_ext_dir, "velib_python"))
+
+# All BLE dependencies from local ext/ submodules (upstream repos)
+for _sub in [
+    os.path.join(_ext_dir, "bleak-connection-manager", "src"),  # bleak_connection_manager
+    os.path.join(_ext_dir, "bleak-retry-connector", "src"),     # bleak_retry_connector
+    os.path.join(_ext_dir, "bluetooth-adapters", "src"),        # bluetooth_adapters
+    os.path.join(_ext_dir, "aiooui", "src"),                    # aiooui
+    os.path.join(_ext_dir, "bleak"),                            # bleak (package at repo root)
+]:
+    if os.path.isdir(_sub) and _sub not in sys.path:
+        sys.path.insert(0, _sub)
 
 from vedbus import VeDbusService  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402
