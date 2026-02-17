@@ -48,16 +48,24 @@ from gi.repository import GLib
 from dbus.mainloop.glib import DBusGMainLoop
 
 # Add ext folders to sys.path
-sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"))
+_ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
+sys.path.insert(1, os.path.join(_ext_dir, "velib_python"))
 
-# Use bleak from dbus-serialbattery's vendored copy if not installed system-wide
-_serialbattery_ext = "/data/apps/dbus-serialbattery/ext"
-if os.path.isdir(_serialbattery_ext) and _serialbattery_ext not in sys.path:
-    sys.path.insert(2, _serialbattery_ext)
+# All BLE dependencies from local ext/ submodules (upstream repos)
+for _sub in [
+    os.path.join(_ext_dir, "bleak-connection-manager", "src"),  # bleak_connection_manager
+    os.path.join(_ext_dir, "bleak-retry-connector", "src"),     # bleak_retry_connector
+    os.path.join(_ext_dir, "bluetooth-adapters", "src"),        # bluetooth_adapters
+    os.path.join(_ext_dir, "aiooui", "src"),                    # aiooui
+    os.path.join(_ext_dir, "bleak"),                            # bleak (package at repo root)
+]:
+    if os.path.isdir(_sub) and _sub not in sys.path:
+        sys.path.insert(0, _sub)
 
 from vedbus import VeDbusService  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402
 
+from bleak_connection_manager import LockConfig, ScanLockConfig  # noqa: E402
 from power_watchdog_ble import (  # noqa: E402
     PowerWatchdogBLE,
     scan_for_devices,
@@ -168,15 +176,11 @@ class PowerWatchdogService:
         self._reconnect_delay = float(defaults.get("reconnect_delay", str(DEFAULT_RECONNECT_DELAY)))
         self._reconnect_max_delay = float(defaults.get("reconnect_max_delay", str(DEFAULT_RECONNECT_MAX_DELAY)))
 
-        # Collect available BLE adapters from config or auto-detect
-        adapter_config = defaults.get("bluetooth_adapters", "").strip()
-        if adapter_config:
-            self._adapters = [a.strip() for a in adapter_config.split(",") if a.strip()]
-        else:
-            self._adapters = self._detect_adapters()
+        # BCM lock configs for cross-process BLE coordination
+        self._lock_config = LockConfig(enabled=True)
+        self._scan_lock_config = ScanLockConfig(enabled=True)
 
         logger.info("Scan interval: %ds", self._scan_interval)
-        logger.info("BLE adapters: %s", self._adapters or ["default"])
 
         # D-Bus connection
         self._bus = get_bus()
@@ -365,24 +369,6 @@ class PowerWatchdogService:
         except Exception:
             logger.exception("Failed to set RunWithoutGridMeter on system bus")
 
-    # ── Adapter detection ───────────────────────────────────────────────────
-
-    @staticmethod
-    def _detect_adapters() -> list[str]:
-        """Detect available Bluetooth adapters on the system."""
-        adapters = []
-        try:
-            hci_dir = "/sys/class/bluetooth"
-            if os.path.isdir(hci_dir):
-                for entry in sorted(os.listdir(hci_dir)):
-                    if entry.startswith("hci") and ":" not in entry:
-                        adapters.append(entry)
-        except Exception:
-            logger.exception("Failed to detect BLE adapters")
-        if not adapters:
-            adapters = [""]
-        return adapters
-
     # ── Toggle callbacks ─────────────────────────────────────────────────────
 
     def _on_has_ac_in_loads_changed(self, path, value):
@@ -458,7 +444,10 @@ class PowerWatchdogService:
         try:
             loop = asyncio.new_event_loop()
             found = loop.run_until_complete(
-                scan_for_devices(adapters=self._adapters, timeout=15.0)
+                scan_for_devices(
+                    timeout=15.0,
+                    scan_lock_config=self._scan_lock_config,
+                )
             )
             loop.close()
             GLib.idle_add(self._process_scan_results, found)
@@ -674,13 +663,13 @@ class PowerWatchdogService:
 
         logger.info("Activating device %s (%s), poll=%dms", mac_id, mac_address, poll_ms)
 
-        # Start BLE client
-        adapter = self._adapters[0] if self._adapters and self._adapters[0] else ""
+        # Start BLE client with BCM lock configs for cross-process coordination
         self._ble = PowerWatchdogBLE(
             address=mac_address,
-            adapter=adapter,
             reconnect_delay=self._reconnect_delay,
             reconnect_max_delay=self._reconnect_max_delay,
+            lock_config=self._lock_config,
+            scan_lock_config=self._scan_lock_config,
         )
 
         # Per-device persistent settings (role, name, position)

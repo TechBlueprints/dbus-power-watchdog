@@ -40,16 +40,24 @@ from gi.repository import GLib
 from dbus.mainloop.glib import DBusGMainLoop
 
 # Add ext folders to sys.path
-sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"))
+_ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
+sys.path.insert(1, os.path.join(_ext_dir, "velib_python"))
 
-# Use bleak from dbus-serialbattery's vendored copy if not installed system-wide
-_serialbattery_ext = "/data/apps/dbus-serialbattery/ext"
-if os.path.isdir(_serialbattery_ext) and _serialbattery_ext not in sys.path:
-    sys.path.insert(2, _serialbattery_ext)
+# All BLE dependencies from local ext/ submodules (upstream repos)
+for _sub in [
+    os.path.join(_ext_dir, "bleak-connection-manager", "src"),  # bleak_connection_manager
+    os.path.join(_ext_dir, "bleak-retry-connector", "src"),     # bleak_retry_connector
+    os.path.join(_ext_dir, "bluetooth-adapters", "src"),        # bluetooth_adapters
+    os.path.join(_ext_dir, "aiooui", "src"),                    # aiooui
+    os.path.join(_ext_dir, "bleak"),                            # bleak (package at repo root)
+]:
+    if os.path.isdir(_sub) and _sub not in sys.path:
+        sys.path.insert(0, _sub)
 
 from vedbus import VeDbusService  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402
 
+from bleak_connection_manager import LockConfig, ScanLockConfig  # noqa: E402
 from power_watchdog_ble import PowerWatchdogBLE, WatchdogData  # noqa: E402
 
 VERSION = "0.6.0"
@@ -122,9 +130,10 @@ class PowerWatchdogDeviceService:
         # Start BLE client in daemon thread
         self._ble = PowerWatchdogBLE(
             address=self._mac_address,
-            adapter=adapter,
             reconnect_delay=reconnect_delay,
             reconnect_max_delay=reconnect_max_delay,
+            lock_config=LockConfig(enabled=True),
+            scan_lock_config=ScanLockConfig(enabled=True),
         )
 
         # D-Bus connection
