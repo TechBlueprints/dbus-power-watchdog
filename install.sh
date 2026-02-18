@@ -91,21 +91,50 @@ else
 fi
 echo ""
 
-# Step 3: Initialize velib_python submodule
-echo "Step 3: Setting up velib_python..."
+# Step 3: Initialize all submodules (BLE stack + velib_python)
+echo "Step 3: Setting up dependencies..."
 cd "$INSTALL_DIR"
-if [ ! -f ext/velib_python/vedbus.py ]; then
-    git submodule update --init --recursive 2>/dev/null || {
-        echo "Submodule init failed, cloning velib_python directly..."
-        mkdir -p ext
-        if [ -d ext/velib_python ]; then
-            rm -rf ext/velib_python
+
+# Required submodules and their fallback clone URLs
+SUBMODULES="
+velib_python|https://github.com/victronenergy/velib_python.git
+bleak-connection-manager|https://github.com/TechBlueprints/bleak-connection-manager.git
+bleak-retry-connector|https://github.com/Bluetooth-Devices/bleak-retry-connector.git
+bleak|https://github.com/hbldh/bleak.git
+bluetooth-adapters|https://github.com/Bluetooth-Devices/bluetooth-adapters.git
+aiooui|https://github.com/Bluetooth-Devices/aiooui.git
+"
+
+git submodule update --init --recursive 2>/dev/null && {
+    echo "All submodules initialized"
+} || {
+    echo "Submodule init failed, cloning dependencies individually..."
+    mkdir -p ext
+    echo "$SUBMODULES" | while IFS='|' read -r name url; do
+        [ -z "$name" ] && continue
+        if [ ! -d "ext/$name/.git" ] && [ ! -f "ext/$name/.git" ]; then
+            echo "  Cloning $name..."
+            rm -rf "ext/$name" 2>/dev/null
+            git clone "$url" "ext/$name" 2>/dev/null || echo "  WARNING: Failed to clone $name"
         fi
-        git clone https://github.com/victronenergy/velib_python.git ext/velib_python
-    }
-    echo "velib_python ready"
+    done
+}
+
+# Verify critical dependencies
+MISSING=""
+for dep in velib_python/vedbus.py bleak/bleak/__init__.py bleak-connection-manager/src/bleak_connection_manager/__init__.py bleak-retry-connector/src/bleak_retry_connector/__init__.py; do
+    if [ ! -f "ext/$dep" ]; then
+        MISSING="$MISSING  ext/$dep\n"
+    fi
+done
+if [ -n "$MISSING" ]; then
+    echo ""
+    echo "WARNING: Some dependencies are missing:"
+    printf "$MISSING"
+    echo "The service may not start correctly."
+    echo "Try: cd $INSTALL_DIR && git submodule update --init --recursive"
 else
-    echo "velib_python already present"
+    echo "All dependencies verified"
 fi
 echo ""
 

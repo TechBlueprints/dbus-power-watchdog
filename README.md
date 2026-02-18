@@ -46,7 +46,12 @@ dbus-power-watchdog.py          (single process — discovery + BLE + grid servi
   ├─ "Report AC Input Loads" system toggle (HasAcInLoads)
   ├─ "Use Inverter Metering" system toggle (RunWithoutGridMeter)
   └─ When a device is enabled:
-       ├─ Connects to the Power Watchdog via BLE (daemon thread)
+       ├─ Connects via bleak-connection-manager (BCM)
+       │    ├─ Cross-process scan locking (fcntl.flock)
+       │    ├─ Cache-first scanning (BlueZ D-Bus cache before StartDiscovery)
+       │    ├─ Pre-scan adapter health checks (detects stale BlueZ state)
+       │    ├─ Adapter rotation and score-based selection
+       │    └─ ConnectionWatchdog for dead connection detection
        └─ Registers com.victronenergy.grid.power_watchdog_{mac_id}
 ```
 
@@ -92,9 +97,23 @@ Scanning handles BLE InProgress errors with retry and adapter rotation.
 
 ## Requirements
 
-- Venus OS (Cerbo GX or similar)
+- Venus OS >= 3.x (Cerbo GX or similar)
 - Hughes Power Watchdog with Bluetooth (gen1 or gen2)
-- BLE adapter available on the GX device
+- BLE adapter available on the GX device (one or two HCI adapters)
+- Python 3 (included with Venus OS)
+- Git (for cloning; the installer will install it via `opkg` if needed)
+
+All BLE dependencies are vendored as git submodules in `ext/` — no pip
+installs or external package management required:
+
+| Submodule | Purpose |
+|-----------|---------|
+| `velib_python` | Victron D-Bus service helper library |
+| `bleak` | Cross-platform BLE client library |
+| `bleak-retry-connector` | Connection retry logic with exponential backoff |
+| `bleak-connection-manager` | BLE connection lifecycle manager (scan locking, adapter rotation, health checks) |
+| `bluetooth-adapters` | HCI adapter enumeration |
+| `aiooui` | OUI (MAC vendor) lookups |
 
 ## Installation
 
@@ -109,9 +128,15 @@ ssh root@<cerbo-ip> "curl -fsSL https://raw.githubusercontent.com/TechBlueprints
 ```bash
 ssh root@<cerbo-ip>
 cd /data/apps
-git clone https://github.com/TechBlueprints/dbus-power-watchdog.git
+git clone --recurse-submodules https://github.com/TechBlueprints/dbus-power-watchdog.git
 cd dbus-power-watchdog
 bash enable.sh
+```
+
+If you cloned without `--recurse-submodules`, initialize them manually:
+
+```bash
+git submodule update --init --recursive
 ```
 
 ## Usage
