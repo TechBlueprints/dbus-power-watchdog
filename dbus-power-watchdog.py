@@ -110,18 +110,16 @@ ROLE_TO_SERVICE = {
 }
 
 
-class SystemBus(dbus.bus.BusConnection):
-    def __new__(cls):
-        return dbus.bus.BusConnection.__new__(cls, dbus.bus.BusConnection.TYPE_SYSTEM)
+def get_bus():
+    """Return the shared system bus connection (singleton provided by dbus-python)."""
+    return dbus.SessionBus() if "DBUS_SESSION_BUS_ADDRESS" in os.environ else dbus.SystemBus()
 
 
-class SessionBus(dbus.bus.BusConnection):
-    def __new__(cls):
-        return dbus.bus.BusConnection.__new__(cls, dbus.bus.BusConnection.TYPE_SESSION)
-
-
-def get_bus() -> dbus.bus.BusConnection:
-    return SessionBus() if "DBUS_SESSION_BUS_ADDRESS" in os.environ else SystemBus()
+def get_private_bus():
+    """Return a new private bus connection (not shared with other callers)."""
+    if "DBUS_SESSION_BUS_ADDRESS" in os.environ:
+        return dbus.SessionBus(private=True)
+    return dbus.SystemBus(private=True)
 
 
 def load_config() -> configparser.ConfigParser:
@@ -675,8 +673,7 @@ class PowerWatchdogService:
         # Per-device persistent settings (role, name, position)
         settings_path = "/Settings/Devices/power_watchdog_%s" % mac_id
         self._grid_settings = SettingsDevice(
-            bus=dbus.SystemBus(private=True) if "DBUS_SESSION_BUS_ADDRESS" not in os.environ
-                else dbus.SessionBus(private=True),
+            bus=self._bus,
             supportedSettings={
                 "role": ["%s/Role" % settings_path, "grid", 0, 0],
                 "custom_name": ["%s/CustomName" % settings_path, "Power Watchdog", 0, 0],
@@ -710,7 +707,7 @@ class PowerWatchdogService:
         # Grid service needs its own bus connection because VeDbusService
         # registers a root object handler on '/', and the switch service
         # already occupies that slot on self._bus.
-        self._grid_bus = get_bus()
+        self._grid_bus = get_private_bus()
 
         svc = VeDbusService(servicename, self._grid_bus, register=False)
 
