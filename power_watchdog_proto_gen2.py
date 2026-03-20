@@ -59,8 +59,6 @@ CMD_ALARM = 14
 
 DL_DATA_SIZE = 34  # bytes per AC line
 
-_RX_NOTIFY_LOG_MAX = 5
-
 
 # ── Protocol class ──────────────────────────────────────────────────────────
 
@@ -72,26 +70,10 @@ class Gen2Protocol:
     ) -> None:
         """Reset protocol-specific state on the BLE instance for a new connection."""
         ble._rx_buffer = bytearray()
-        ble._rx_notify_log_count = 0
         ble._logged_bad_tail = False
-        ble._logged_first_valid_frame = False
 
     def notification_handler(self, ble: PowerWatchdogBLE, _sender, data: bytearray) -> None:
         """Buffer incoming bytes and extract framed packets."""
-        cnt = getattr(ble, "_rx_notify_log_count", 0)
-        if cnt < _RX_NOTIFY_LOG_MAX:
-            ble._rx_notify_log_count = cnt + 1
-            preview = bytes(data[:64]).hex()
-            logger.info(
-                "RX notify #%d: %d bytes from sender=%s; "
-                "first 64 bytes (hex)=%s%s",
-                cnt + 1,
-                len(data),
-                _sender,
-                preview,
-                "..." if len(data) > 64 else "",
-            )
-
         ble._rx_buffer.extend(data)
 
         if len(ble._rx_buffer) > MAX_BUFFER_SIZE:
@@ -183,13 +165,6 @@ class Gen2Protocol:
         wd = getattr(ble, "_watchdog", None)
         if wd is not None:
             wd.notify_activity()
-
-        if not getattr(ble, "_logged_first_valid_frame", False):
-            ble._logged_first_valid_frame = True
-            logger.info(
-                "First valid framed packet: cmd=%d body_len=%d (magic+tail OK)",
-                cmd, len(body),
-            )
 
         if cmd == CMD_DL_REPORT:
             _parse_dl_report(ble, body, raw_hex)

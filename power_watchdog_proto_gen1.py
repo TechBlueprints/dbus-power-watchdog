@@ -67,8 +67,6 @@ GEN1_CHUNK_SIZE = 20           # each BLE notification is exactly 20 bytes
 GEN1_MERGED_SIZE = 40          # two chunks merged
 GEN1_HEADER = bytes([0x01, 0x03, 0x20])  # first chunk sentinel
 
-_RX_NOTIFY_LOG_MAX = 5
-
 
 # ── Protocol class ──────────────────────────────────────────────────────────
 
@@ -87,8 +85,6 @@ class Gen1Protocol:
         """
         ble._gen1_first_chunk = None
         ble._gen1_is_v2v3 = False
-        ble._rx_notify_log_count = 0
-        ble._logged_first_valid_frame = False
 
         if device_name:
             from power_watchdog_ble import classify_device
@@ -110,16 +106,6 @@ class Gen1Protocol:
 
     def notification_handler(self, ble: PowerWatchdogBLE, _sender, data: bytearray) -> None:
         """Reassemble 20-byte chunk pairs into 40-byte telemetry frames."""
-        cnt = getattr(ble, "_rx_notify_log_count", 0)
-        if cnt < _RX_NOTIFY_LOG_MAX:
-            ble._rx_notify_log_count = cnt + 1
-            logger.info(
-                "RX notify #%d (gen1): %d bytes hex=%s",
-                cnt + 1,
-                len(data),
-                bytes(data[:40]).hex(),
-            )
-
         if len(data) != GEN1_CHUNK_SIZE:
             logger.debug(
                 "Gen1: ignoring %d-byte notification (expected %d)",
@@ -141,13 +127,6 @@ class Gen1Protocol:
         wd = getattr(ble, "_watchdog", None)
         if wd is not None:
             wd.notify_activity()
-
-        if not getattr(ble, "_logged_first_valid_frame", False):
-            ble._logged_first_valid_frame = True
-            logger.info(
-                "First valid Gen1 telemetry frame: 40 bytes hex=%s",
-                merged.hex(),
-            )
 
         parse_gen1_telemetry(ble, merged)
 

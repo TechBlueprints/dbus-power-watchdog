@@ -525,7 +525,7 @@ class PowerWatchdogService:
             )
             ctx.add_path("%s/Settings/CustomName" % output_path, "", writeable=True)
             ctx.add_path("%s/Settings/Type" % output_path, switch_type, writeable=False)
-            ctx.add_path("%s/Settings/ValidTypes" % output_path, 4)
+            ctx.add_path("%s/Settings/ValidTypes" % output_path, 6)
             ctx.add_path("%s/Settings/Function" % output_path, 2, writeable=True)
             ctx.add_path("%s/Settings/ValidFunctions" % output_path, 4)
             ctx.add_path("%s/Settings/Group" % output_path, "", writeable=True)

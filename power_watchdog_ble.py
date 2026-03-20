@@ -584,22 +584,13 @@ class PowerWatchdogBLE:
                 n_char = sum(
                     len(svc.characteristics) for svc in client.services
                 )
-                logger.info(
+                logger.debug(
                     "GATT table for %s (%d services, %d characteristics):\n%s",
                     self.address,
                     n_svc,
                     n_char,
                     format_gatt_snapshot(client),
                 )
-
-                for svc in client.services:
-                    logger.debug("Service: %s", svc.uuid)
-                    for char in svc.characteristics:
-                        logger.debug(
-                            "  Char: %s [%s]",
-                            char.uuid,
-                            ",".join(char.properties),
-                        )
 
                 notify_uuid, write_uuid, write_resp, gatt_mode = (
                     resolve_power_watchdog_gatt(client)
@@ -664,9 +655,8 @@ class PowerWatchdogBLE:
                 elif not client.is_connected:
                     logger.warning(
                         "BLE link dropped for %s (BlueZ/peripheral closed "
-                        "connection); saw_valid_frame=%s",
+                        "connection)",
                         self.address,
-                        getattr(self, "_logged_first_valid_frame", False),
                     )
                 else:
                     logger.info(
