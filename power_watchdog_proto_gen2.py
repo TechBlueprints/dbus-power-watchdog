@@ -67,7 +67,9 @@ _RX_NOTIFY_LOG_MAX = 5
 class Gen2Protocol:
     """Gen2 framed binary protocol handler."""
 
-    def init_state(self, ble: PowerWatchdogBLE) -> None:
+    def init_state(
+        self, ble: PowerWatchdogBLE, device_name: str | None = None,
+    ) -> None:
         """Reset protocol-specific state on the BLE instance for a new connection."""
         ble._rx_buffer = bytearray()
         ble._rx_notify_log_count = 0

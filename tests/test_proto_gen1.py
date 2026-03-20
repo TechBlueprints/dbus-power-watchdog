@@ -26,7 +26,7 @@ from power_watchdog_proto_gen1 import (
 # ── Test instance factory ──────────────────────────────────────────────────
 
 
-def _make_ble_instance():
+def _make_ble_instance(device_name=None):
     """Create a PowerWatchdogBLE with daemon thread suppressed and Gen1 state."""
     with patch.object(PowerWatchdogBLE, "__init__", lambda self, **kw: None):
         ble = PowerWatchdogBLE.__new__(PowerWatchdogBLE)
@@ -39,7 +39,7 @@ def _make_ble_instance():
     ble._sleep_task = None
 
     proto = Gen1Protocol()
-    proto.init_state(ble)
+    proto.init_state(ble, device_name=device_name)
     return ble, proto
 
 
@@ -239,3 +239,63 @@ class TestGen1LineDetection:
         parse_gen1_telemetry(ble, m2)
         data = ble.get_data()
         assert abs(data.l2.voltage - 119.0) < 0.01
+
+
+# ── BLE name version pre-seeding ──────────────────────────────────────────
+
+
+def _gen1_name(line_char: str, version_code: str) -> str:
+    """Build a 19-char Gen1 BLE name with a specific version at [15:17]."""
+    # PM{S|D} + 12 fill chars + version_code (2) + 2 fill = 19
+    return "PM" + line_char + "X" * 12 + version_code + "XX"
+
+
+class TestGen1NameVersionPreset:
+    """Tests for init_state pre-setting flags from the BLE advertised name."""
+
+    def test_v2_name_presets_is_v2v3(self):
+        ble, _ = _make_ble_instance(device_name=_gen1_name("D", "E3"))
+        assert ble._gen1_is_v2v3 is True
+        assert ble._data.has_l2 is False
+
+    def test_v3_name_presets_is_v2v3(self):
+        ble, _ = _make_ble_instance(device_name=_gen1_name("S", "E4"))
+        assert ble._gen1_is_v2v3 is True
+
+    def test_v1_double_name_presets_has_l2(self):
+        ble, _ = _make_ble_instance(device_name=_gen1_name("D", "E2"))
+        assert ble._gen1_is_v2v3 is False
+        assert ble._data.has_l2 is True
+
+    def test_v1_single_name_no_presets(self):
+        ble, _ = _make_ble_instance(device_name=_gen1_name("S", "E2"))
+        assert ble._gen1_is_v2v3 is False
+        assert ble._data.has_l2 is False
+
+    def test_unknown_version_no_presets(self):
+        ble, _ = _make_ble_instance(device_name=_gen1_name("D", "XX"))
+        assert ble._gen1_is_v2v3 is False
+        assert ble._data.has_l2 is False
+
+    def test_no_name_no_presets(self):
+        ble, _ = _make_ble_instance(device_name=None)
+        assert ble._gen1_is_v2v3 is False
+        assert ble._data.has_l2 is False
+
+    def test_v1_double_first_zero_markers_are_l2(self):
+        """With name-based pre-seeding, v1 dual-line correctly assigns
+        the very first (0,0,0) frame as L2 — no bootstrapping gap."""
+        ble, _ = _make_ble_instance(device_name=_gen1_name("D", "E2"))
+        m = _build_gen1_merged(voltage_v=119.0, line_markers=(0, 0, 0))
+        parse_gen1_telemetry(ble, m)
+        data = ble.get_data()
+        assert abs(data.l2.voltage - 119.0) < 0.01
+
+    def test_v2v3_preset_zero_markers_are_l1(self):
+        """With name-based pre-seeding, v2/v3 correctly treats (0,0,0)
+        as L1 from the very first frame."""
+        ble, _ = _make_ble_instance(device_name=_gen1_name("D", "E3"))
+        m = _build_gen1_merged(voltage_v=120.0, line_markers=(0, 0, 0))
+        parse_gen1_telemetry(ble, m)
+        data = ble.get_data()
+        assert abs(data.l1.voltage - 120.0) < 0.01

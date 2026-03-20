@@ -275,6 +275,7 @@ class TestClassifyDevice:
         assert result.generation == 1
         assert result.device_type == "PMS"
         assert result.line_type == "single"
+        assert result.hw_version == 0  # no valid version at [15:17]
 
     def test_gen1_double_50a(self):
         name = "PMD" + "B" * 16
@@ -284,6 +285,25 @@ class TestClassifyDevice:
         assert result.generation == 1
         assert result.device_type == "PMD"
         assert result.line_type == "double"
+        assert result.hw_version == 0
+
+    def test_gen1_hw_version_v1(self):
+        name = "PMD" + "X" * 12 + "E2" + "XX"
+        assert len(name) == 19
+        result = classify_device(name)
+        assert result.hw_version == 1
+
+    def test_gen1_hw_version_v2(self):
+        name = "PMS" + "X" * 12 + "E3" + "XX"
+        assert len(name) == 19
+        result = classify_device(name)
+        assert result.hw_version == 2
+
+    def test_gen1_hw_version_v3(self):
+        name = "PMD" + "X" * 12 + "E4" + "XX"
+        assert len(name) == 19
+        result = classify_device(name)
+        assert result.hw_version == 3
 
     def test_gen1_with_trailing_spaces(self):
         # 19-char name padded to 27 with spaces

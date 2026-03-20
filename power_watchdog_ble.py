@@ -242,6 +242,7 @@ class DiscoveredDevice:
     generation: int = 0    # 1 = gen1 (BT-only), 2 = gen2 (WiFi+BT)
     device_type: str = ""  # e.g., "E7" for gen2, "PMD" for gen1 50A
     line_type: str = ""    # "single" (30A) or "double" (50A)
+    hw_version: int = 0    # Gen1 only: 1/2/3 from name[15:17] E2/E3/E4
 
 
 def classify_device(name: str) -> DiscoveredDevice | None:
@@ -285,12 +286,16 @@ def classify_device(name: str) -> DiscoveredDevice | None:
                 line_type = "double"
             else:
                 line_type = "unknown"
+            # Hardware version from name[15:17]: "E2"→1, "E3"→2, "E4"→3
+            _GEN1_VERSIONS = {"E2": 1, "E3": 2, "E4": 3}
+            hw_version = _GEN1_VERSIONS.get(effective_name[15:17], 0)
             return DiscoveredDevice(
                 mac="",  # filled in by caller
                 name=name,
                 generation=1,
                 device_type=effective_name[:3],  # e.g., "PMD", "PMS"
                 line_type=line_type,
+                hw_version=hw_version,
             )
 
     return None
@@ -608,11 +613,12 @@ class PowerWatchdogBLE:
                 )
 
                 # Select and initialize protocol handler
+                device_name = getattr(device, "name", None)
                 if gatt_mode == "gen1_uart":
                     proto = Gen1Protocol()
                 else:
                     proto = Gen2Protocol()
-                proto.init_state(self)
+                proto.init_state(self, device_name=device_name)
 
                 # Subscribe to notifications
                 handler = lambda sender, data: proto.notification_handler(

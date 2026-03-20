@@ -75,12 +75,38 @@ _RX_NOTIFY_LOG_MAX = 5
 class Gen1Protocol:
     """Gen1 raw Modbus-style telemetry protocol handler."""
 
-    def init_state(self, ble: PowerWatchdogBLE) -> None:
-        """Reset protocol-specific state on the BLE instance for a new connection."""
+    def init_state(
+        self, ble: PowerWatchdogBLE, device_name: str | None = None,
+    ) -> None:
+        """Reset protocol-specific state on the BLE instance for a new connection.
+
+        If *device_name* is provided, the hardware version and line type
+        are derived from the BLE advertised name (matching the official
+        app's logic) so that line detection is correct from the very
+        first telemetry frame.
+        """
         ble._gen1_first_chunk = None
         ble._gen1_is_v2v3 = False
         ble._rx_notify_log_count = 0
         ble._logged_first_valid_frame = False
+
+        if device_name:
+            from power_watchdog_ble import classify_device
+            classified = classify_device(device_name)
+            if classified and classified.generation == 1:
+                if classified.hw_version in (2, 3):
+                    ble._gen1_is_v2v3 = True
+                    logger.info(
+                        "Gen1 v%d detected from BLE name — using "
+                        "(1,1,1) L2 markers", classified.hw_version,
+                    )
+                elif (classified.hw_version == 1
+                      and classified.line_type == "double"):
+                    ble._data.has_l2 = True
+                    logger.info(
+                        "Gen1 v1 dual-line detected from BLE name — "
+                        "pre-setting has_l2",
+                    )
 
     def notification_handler(self, ble: PowerWatchdogBLE, _sender, data: bytearray) -> None:
         """Reassemble 20-byte chunk pairs into 40-byte telemetry frames."""
