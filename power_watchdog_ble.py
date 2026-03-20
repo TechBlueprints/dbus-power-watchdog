@@ -132,6 +132,23 @@ DL_DATA_SIZE = 34
 # of silence almost certainly means the radio link is dead.
 NOTIFICATION_WATCHDOG_TIMEOUT = 120.0  # seconds
 
+# Log the first N raw notifications after each connect (INFO) for field debugging.
+_RX_NOTIFY_LOG_MAX = 5
+
+
+def format_gatt_snapshot(client: BleakClient) -> str:
+    """Human-readable GATT tree for support logs (multi-line string)."""
+    lines: list[str] = []
+    for svc in client.services:
+        suuid = getattr(svc, "uuid", "(unknown service)")
+        lines.append("  service %s" % suuid)
+        for char in svc.characteristics:
+            lines.append(
+                "    char %s [%s]"
+                % (char.uuid, ",".join(str(p) for p in char.properties)),
+            )
+    return "\n".join(lines) if lines else "  (no services)"
+
 
 def resolve_power_watchdog_gatt(client: BleakClient) -> tuple[str, str, bool, str]:
     """Map GATT services to notify UUID, write UUID, and write mode.
@@ -153,20 +170,39 @@ def resolve_power_watchdog_gatt(client: BleakClient) -> tuple[str, str, bool, st
         p = char_props[u_g2]
         if "notify" in p:
             use_resp = "write" in p
+            reason = (
+                "gen2 ff01 notify+write"
+                if use_resp
+                else "gen2 ff01 notify (no 'write' prop, using write-without-response)"
+            )
+            logger.info("GATT pick: %s", reason)
             return (
                 CHARACTERISTIC_UUID_GEN2,
                 CHARACTERISTIC_UUID_GEN2,
                 use_resp,
                 "gen2",
             )
+        logger.warning(
+            "GATT: characteristic %s is present but has no 'notify' property "
+            "(props=%s); cannot use gen2 path",
+            CHARACTERISTIC_UUID_GEN2,
+            ",".join(str(x) for x in p),
+        )
 
     u_tx = CHARACTERISTIC_UUID_GEN1_TX.lower()
     u_rx = CHARACTERISTIC_UUID_GEN1_RX.lower()
     if u_tx in char_props and u_rx in char_props:
         pt, prx = char_props[u_tx], char_props[u_rx]
         if "notify" not in pt:
-            pass
+            logger.warning(
+                "GATT: gen1 TX %s missing 'notify' (props=%s)",
+                CHARACTERISTIC_UUID_GEN1_TX,
+                ",".join(str(x) for x in pt),
+            )
         elif "write-without-response" in prx:
+            logger.info(
+                "GATT pick: gen1 UART TX notify + RX write-without-response",
+            )
             return (
                 CHARACTERISTIC_UUID_GEN1_TX,
                 CHARACTERISTIC_UUID_GEN1_RX,
@@ -174,12 +210,25 @@ def resolve_power_watchdog_gatt(client: BleakClient) -> tuple[str, str, bool, st
                 "gen1_uart",
             )
         elif "write" in prx:
+            logger.info("GATT pick: gen1 UART TX notify + RX write (with response)")
             return (
                 CHARACTERISTIC_UUID_GEN1_TX,
                 CHARACTERISTIC_UUID_GEN1_RX,
                 True,
                 "gen1_uart",
             )
+        else:
+            logger.warning(
+                "GATT: gen1 RX %s has no write props (props=%s)",
+                CHARACTERISTIC_UUID_GEN1_RX,
+                ",".join(str(x) for x in prx),
+            )
+    elif u_tx in char_props or u_rx in char_props:
+        logger.warning(
+            "GATT: partial gen1 UART (TX present=%s RX present=%s)",
+            u_tx in char_props,
+            u_rx in char_props,
+        )
 
     found: list[str] = []
     for svc in client.services:
@@ -187,6 +236,11 @@ def resolve_power_watchdog_gatt(client: BleakClient) -> tuple[str, str, bool, st
             found.append(
                 "%s[%s]" % (char.uuid, ",".join(char.properties)),
             )
+    detail = "; ".join(found)
+    logger.error(
+        "GATT resolution failed; full table:\n%s",
+        format_gatt_snapshot(client),
+    )
     raise BleakError(
         "Power Watchdog GATT not recognized: need %s (gen2) or %s+%s (gen1). "
         "Found: %s"
@@ -194,7 +248,7 @@ def resolve_power_watchdog_gatt(client: BleakClient) -> tuple[str, str, bool, st
             CHARACTERISTIC_UUID_GEN2,
             CHARACTERISTIC_UUID_GEN1_TX,
             CHARACTERISTIC_UUID_GEN1_RX,
-            "; ".join(found),
+            detail,
         ),
     )
 
@@ -546,9 +600,23 @@ class PowerWatchdogBLE:
                 )
                 self._connected = True
                 self._rx_buffer.clear()
+                self._rx_notify_log_count = 0
+                self._logged_bad_tail = False
+                self._logged_first_valid_frame = False
                 delay = self.reconnect_delay  # reset backoff
 
-                # Log discovered services for debugging
+                n_svc = sum(1 for _ in client.services)
+                n_char = sum(
+                    len(svc.characteristics) for svc in client.services
+                )
+                logger.info(
+                    "GATT table for %s (%d services, %d characteristics):\n%s",
+                    self.address,
+                    n_svc,
+                    n_char,
+                    format_gatt_snapshot(client),
+                )
+
                 for svc in client.services:
                     logger.debug("Service: %s", svc.uuid)
                     for char in svc.characteristics:
@@ -571,17 +639,48 @@ class PowerWatchdogBLE:
 
                 # Subscribe to notifications
                 logger.info("Subscribing to notifications on %s", notify_uuid)
-                await asyncio.wait_for(
-                    client.start_notify(notify_uuid, self._notification_handler),
-                    timeout=5.0,
-                )
+                try:
+                    await asyncio.wait_for(
+                        client.start_notify(
+                            notify_uuid, self._notification_handler
+                        ),
+                        timeout=5.0,
+                    )
+                except Exception:
+                    logger.exception(
+                        "start_notify failed for %s (mode=%s)",
+                        notify_uuid,
+                        gatt_mode,
+                    )
+                    raise
+                logger.info("Notifications enabled on %s", notify_uuid)
 
                 # Send handshake to start data flow
-                logger.info("Sending handshake...")
-                await client.write_gatt_char(
-                    write_uuid, HANDSHAKE_PAYLOAD, response=write_resp
+                logger.info(
+                    "Sending handshake (%d bytes) to %s response=%s",
+                    len(HANDSHAKE_PAYLOAD),
+                    write_uuid,
+                    write_resp,
                 )
-                logger.info("Handshake sent, waiting for data...")
+                try:
+                    await client.write_gatt_char(
+                        write_uuid, HANDSHAKE_PAYLOAD, response=write_resp
+                    )
+                except Exception:
+                    logger.exception(
+                        "Handshake write failed: uuid=%s response=%s len=%d "
+                        "mode=%s",
+                        write_uuid,
+                        write_resp,
+                        len(HANDSHAKE_PAYLOAD),
+                        gatt_mode,
+                    )
+                    raise
+                logger.info(
+                    "Handshake completed; waiting for framed packets (magic "
+                    "0x%08X)...",
+                    PACKET_IDENTIFIER,
+                )
 
                 # Step 4: Start connection watchdog
                 self._watchdog = ConnectionWatchdog(
@@ -654,6 +753,20 @@ class PowerWatchdogBLE:
 
     def _notification_handler(self, _sender, data: bytearray):
         """Handle incoming BLE notification: buffer and parse framed packets."""
+        cnt = getattr(self, "_rx_notify_log_count", 0)
+        if cnt < _RX_NOTIFY_LOG_MAX:
+            self._rx_notify_log_count = cnt + 1
+            preview = bytes(data[:64]).hex()
+            logger.info(
+                "RX notify #%d: %d bytes from sender=%s; "
+                "first 64 bytes (hex)=%s%s",
+                cnt + 1,
+                len(data),
+                _sender,
+                preview,
+                "..." if len(data) > 64 else "",
+            )
+
         self._rx_buffer.extend(data)
 
         # Safety: prevent unbounded buffer growth
@@ -712,7 +825,24 @@ class PowerWatchdogBLE:
         del buf[:total_len]
 
         if tail != PACKET_TAIL:
-            logger.debug("Bad packet tail 0x%04X (expected 0x%04X)", tail, PACKET_TAIL)
+            if not getattr(self, "_logged_bad_tail", False):
+                self._logged_bad_tail = True
+                hx = raw_hex[:200] + ("..." if len(raw_hex) > 200 else "")
+                logger.warning(
+                    "Bad packet tail 0x%04X (expected 0x%04X); "
+                    "cmd=%d data_len=%d frame_hex_prefix=%s",
+                    tail,
+                    PACKET_TAIL,
+                    cmd,
+                    data_len,
+                    hx,
+                )
+            else:
+                logger.debug(
+                    "Bad packet tail 0x%04X (expected 0x%04X)",
+                    tail,
+                    PACKET_TAIL,
+                )
             return True  # consumed bytes, try next
 
         # Valid packet — feed the connection watchdog.
@@ -721,6 +851,14 @@ class PowerWatchdogBLE:
         wd = getattr(self, "_watchdog", None)
         if wd is not None:
             wd.notify_activity()
+
+        if not getattr(self, "_logged_first_valid_frame", False):
+            self._logged_first_valid_frame = True
+            logger.info(
+                "First valid framed packet: cmd=%d body_len=%d (magic+tail OK)",
+                cmd,
+                len(body),
+            )
 
         # Dispatch by command
         if cmd == CMD_DL_REPORT:

@@ -21,6 +21,7 @@ from power_watchdog_ble import (
     WatchdogData,
     PowerWatchdogBLE,
     resolve_power_watchdog_gatt,
+    format_gatt_snapshot,
     CHARACTERISTIC_UUID_GEN2,
     CHARACTERISTIC_UUID_GEN1_TX,
     CHARACTERISTIC_UUID_GEN1_RX,
@@ -54,6 +55,33 @@ class _MockSvc:
 class _MockClient:
     def __init__(self, services: list[_MockSvc]):
         self.services = services
+
+
+class _MockSvcWithUuid:
+    def __init__(self, uuid: str, characteristics: list[_MockChar]):
+        self.uuid = uuid
+        self.characteristics = characteristics
+
+
+class TestFormatGattSnapshot:
+    def test_snapshot_multiline(self):
+        c = _MockClient(
+            [
+                _MockSvcWithUuid(
+                    "0000ffe0-0000-1000-8000-00805f9b34fb",
+                    [
+                        _MockChar(
+                            CHARACTERISTIC_UUID_GEN1_TX,
+                            ["notify"],
+                        ),
+                    ],
+                ),
+            ],
+        )
+        text = format_gatt_snapshot(c)
+        assert "0000ffe0" in text
+        assert "0000ffe2" in text
+        assert "notify" in text
 
 
 class TestResolvePowerWatchdogGatt:
