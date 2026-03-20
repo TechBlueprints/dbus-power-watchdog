@@ -101,6 +101,23 @@ DEFAULT_RECONNECT_MAX_DELAY = 120
 # https://github.com/victronenergy/gui-v2/pull/2816
 PRODUCT_ID_FRONIUS = 0xA142
 
+ERROR_MESSAGES = {
+    0: "",
+    1: "Line 1 Voltage Error",
+    2: "Line 2 Voltage Error",
+    3: "Line 1 Over Current",
+    4: "Line 2 Over Current",
+    5: "Line 1 Neutral Reversed",
+    6: "Line 2 Neutral Reversed",
+    7: "Missing Ground",
+    8: "Neutral Missing",
+    9: "Surge Protection Used Up",
+    11: "Line 1 Frequency Error",
+    12: "Line 2 Frequency Error",
+    13: "Over Temperature",
+    14: "Boost Error",
+}
+
 # Valid roles and their D-Bus service class
 ALLOWED_ROLES = ["grid", "pvinverter", "genset"]
 ROLE_TO_SERVICE = {
@@ -764,6 +781,7 @@ class PowerWatchdogService:
             svc.add_path("/Ac/%s/Frequency" % phase, None, gettextcallback=_fmt_hz)
 
         svc.add_path("/ErrorCode", 0)
+        svc.add_path("/ErrorMessage", "")
         self._update_index = 0
         svc.add_path("/UpdateIndex", 0)
 
@@ -899,6 +917,9 @@ class PowerWatchdogService:
                 self._grid_service["/Ac/Frequency"] = round(l1.frequency, 1)
             self._grid_service["/Ac/Energy/Forward"] = round(total_energy, 2)
             self._grid_service["/ErrorCode"] = error_code
+            self._grid_service["/ErrorMessage"] = ERROR_MESSAGES.get(
+                error_code, "Unknown Error %d" % error_code
+            )
 
             self._update_index = (self._update_index + 1) % 256
             self._grid_service["/UpdateIndex"] = self._update_index
