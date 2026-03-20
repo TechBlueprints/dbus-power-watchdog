@@ -19,51 +19,25 @@ BLE client for the Hughes Power Watchdog surge protector.
 
 BLE protocol based on prior open-source work by spbrogan and tango2590.
 
-The framed binary protocol is the same on all supported hardware, but GATT
-layout differs:
+Hughes shipped two generations with completely different BLE protocols:
 
-- **Gen2** (WD_* names): one characteristic ``0000ff01`` for notify + write.
-- **Gen1** (PM* names, BT-only): Nordic UART-style ``0000ffe2`` (TX, notify)
-  and ``0000fff5`` (RX, write) under vendor service ``0000ffe0``.
+- **Gen2** (WD_* names, WiFi+BT): custom framed binary protocol over a
+  single characteristic (``0000ff01``).  Requires an ASCII handshake to
+  start data flow.  See :mod:`power_watchdog_proto_gen2`.
 
-Each BLE notification contains (potentially partial) packet data:
+- **Gen1** (PM* names, BT-only): raw Modbus-style 20-byte notification
+  pairs over Nordic UART characteristics (``0000ffe2`` / ``0000fff5``).
+  Telemetry starts immediately on subscribe.
+  See :mod:`power_watchdog_proto_gen1`.
 
-    [0x24797740]  4-byte identifier
-    [version]     1 byte
-    [msgId]       1 byte
-    [cmd]         1 byte  (1=DLReport, 2=ErrorReport, 14=Alarm)
-    [dataLen]     2 bytes (big-endian)
-    [body]        dataLen bytes
-    [0x7121]      2-byte tail
-
-DLReport body (cmd=1):
-  - 34 bytes per line (30A = 34 bytes total, 50A = 68 bytes for L1+L2)
-  - Each 34-byte DLData block:
-      [0:4]   inputVoltage  (big-endian int32, /10000 = V)
-      [4:8]   current       (big-endian int32, /10000 = A)
-      [8:12]  power         (big-endian int32, /10000 = W)
-      [12:16] energy        (big-endian int32, /10000 = kWh)
-      [16:20] temp1         (unused)
-      [20:24] outputVoltage (big-endian int32, /10000 = V)
-      [24]    backlight
-      [25]    neutralDetection
-      [26]    boost flag
-      [27]    temperature
-      [28:32] frequency     (big-endian int32, /100 = Hz)
-      [32]    error code    (0-9)
-      [33]    status
-
-Connection sequence:
-  1. Scan and connect (via bleak-connection-manager)
-  2. Subscribe on the notify characteristic (ff01 gen2, or ffe2 gen1)
-  3. Send handshake to the write characteristic (same as notify for gen2,
-     or fff5 RX for gen1): "!%!%,protocol,open,"
-  4. Parse incoming framed packets
+This module contains shared infrastructure: data models, BLE device
+discovery, GATT resolution, and the ``PowerWatchdogBLE`` connection
+lifecycle.  Protocol-specific parsing and handshake logic lives in the
+``power_watchdog_proto_*`` modules.
 """
 
 import asyncio
 import logging
-import struct
 import threading
 import time
 from dataclasses import dataclass, field
@@ -97,7 +71,7 @@ GEN2_PREFIX = "WD_"
 # S = single/30A, D = double/50A
 GEN1_PREFIX = "PM"
 
-# ── Protocol constants ──────────────────────────────────────────────────────
+# ── GATT UUID constants ────────────────────────────────────────────────────
 
 # Gen2: single characteristic for notify + write
 CHARACTERISTIC_UUID_GEN2 = "0000ff01-0000-1000-8000-00805f9b34fb"
@@ -109,31 +83,10 @@ CHARACTERISTIC_UUID_GEN1_RX = "0000fff5-0000-1000-8000-00805f9b34fb"
 # Backwards-compatible alias — gen2 data path
 CHARACTERISTIC_UUID = CHARACTERISTIC_UUID_GEN2
 
-# Handshake payload: ASCII "!%!%,protocol,open,"
-HANDSHAKE_PAYLOAD = bytes.fromhex("212521252c70726f746f636f6c2c6f70656e2c")
-
-# Packet framing
-PACKET_IDENTIFIER = 0x24797740  # 4-byte magic
-PACKET_TAIL = 0x7121  # 2-byte tail
-HEADER_SIZE = 9  # 4 (identifier) + 1 (version) + 1 (msgId) + 1 (cmd) + 2 (dataLen)
-TAIL_SIZE = 2
-MAX_BUFFER_SIZE = 8192
-
-# Command IDs
-CMD_DL_REPORT = 1
-CMD_ERROR_REPORT = 2
-CMD_ALARM = 14
-
-# DLData block size (per line)
-DL_DATA_SIZE = 34
-
 # Notification watchdog: force reconnect if no BLE notifications arrive
 # within this window.  Power Watchdog sends updates ~every 30s, so 2 minutes
 # of silence almost certainly means the radio link is dead.
 NOTIFICATION_WATCHDOG_TIMEOUT = 120.0  # seconds
-
-# Log the first N raw notifications after each connect (INFO) for field debugging.
-_RX_NOTIFY_LOG_MAX = 5
 
 
 def format_gatt_snapshot(client: BleakClient) -> str:
@@ -403,6 +356,10 @@ class PowerWatchdogBLE:
     - managed_find_device for scanning (with scan lock + adapter rotation)
     - establish_connection for connecting (with connect lock + all workarounds)
     - ConnectionWatchdog for detecting dead connections
+
+    Protocol-specific notification handling and handshake logic is delegated
+    to :class:`~power_watchdog_proto_gen2.Gen2Protocol` or
+    :class:`~power_watchdog_proto_gen1.Gen1Protocol` based on GATT resolution.
     """
 
     # When the device is completely offline (not found during scan),
@@ -440,9 +397,6 @@ class PowerWatchdogBLE:
 
         # Connection watchdog (set when connected)
         self._watchdog: ConnectionWatchdog | None = None
-
-        # Packet reassembly buffer (notifications may be fragmented)
-        self._rx_buffer = bytearray()
 
         # Start BLE daemon thread
         self._thread = threading.Thread(
@@ -537,13 +491,19 @@ class PowerWatchdogBLE:
                 self._loop = None
 
     async def _async_main(self):
-        """Connect, subscribe, handshake, and stay connected.
+        """Connect, subscribe, and stay connected.
 
         Uses bleak-connection-manager for all BLE operations:
         1. managed_find_device — scan with lock + adapter rotation
         2. establish_connection — connect with all workarounds
         3. ConnectionWatchdog — detect dead radio links
+
+        Protocol-specific notification handling and handshake logic is
+        delegated to a protocol object selected after GATT resolution.
         """
+        from power_watchdog_proto_gen1 import Gen1Protocol
+        from power_watchdog_proto_gen2 import Gen2Protocol
+
         delay = self.reconnect_delay
         policy_adapters = (
             self._ble_adapters
@@ -586,13 +546,9 @@ class PowerWatchdogBLE:
                         self.address, self.OFFLINE_POLL_INTERVAL,
                     )
                     await self._interruptible_sleep(self.OFFLINE_POLL_INTERVAL)
-                    # Don't escalate backoff for "device not found" — the
-                    # device may simply be unplugged and will reappear.
-                    # Keep delay at its current value for connection errors.
                     continue
 
-                # Step 2: Connect via BCM (handles phantom cleanup,
-                # adapter rotation, InProgress, GATT validation, etc.)
+                # Step 2: Connect via BCM
                 logger.info(
                     "Connecting to Power Watchdog %s...", self.address,
                 )
@@ -611,17 +567,13 @@ class PowerWatchdogBLE:
                     overall_timeout=300.0,
                 )
 
-                # Step 3: Connected — set up notifications and handshake
+                # Step 3: Connected — resolve GATT and pick protocol
                 logger.info(
                     "Connected to Power Watchdog %s (MTU: %d)",
                     self.address, client.mtu_size,
                 )
                 self._connected = True
-                self._rx_buffer.clear()
-                self._rx_notify_log_count = 0
-                self._logged_bad_tail = False
-                self._logged_first_valid_frame = False
-                delay = self.reconnect_delay  # reset backoff
+                delay = self.reconnect_delay
 
                 n_svc = sum(1 for _ in client.services)
                 n_char = sum(
@@ -655,13 +607,21 @@ class PowerWatchdogBLE:
                     write_resp,
                 )
 
+                # Select and initialize protocol handler
+                if gatt_mode == "gen1_uart":
+                    proto = Gen1Protocol()
+                else:
+                    proto = Gen2Protocol()
+                proto.init_state(self)
+
                 # Subscribe to notifications
+                handler = lambda sender, data: proto.notification_handler(
+                    self, sender, data,
+                )
                 logger.info("Subscribing to notifications on %s", notify_uuid)
                 try:
                     await asyncio.wait_for(
-                        client.start_notify(
-                            notify_uuid, self._notification_handler
-                        ),
+                        client.start_notify(notify_uuid, handler),
                         timeout=5.0,
                     )
                 except Exception:
@@ -673,32 +633,8 @@ class PowerWatchdogBLE:
                     raise
                 logger.info("Notifications enabled on %s", notify_uuid)
 
-                # Send handshake to start data flow
-                logger.info(
-                    "Sending handshake (%d bytes) to %s response=%s",
-                    len(HANDSHAKE_PAYLOAD),
-                    write_uuid,
-                    write_resp,
-                )
-                try:
-                    await client.write_gatt_char(
-                        write_uuid, HANDSHAKE_PAYLOAD, response=write_resp
-                    )
-                except Exception:
-                    logger.exception(
-                        "Handshake write failed: uuid=%s response=%s len=%d "
-                        "mode=%s",
-                        write_uuid,
-                        write_resp,
-                        len(HANDSHAKE_PAYLOAD),
-                        gatt_mode,
-                    )
-                    raise
-                logger.info(
-                    "Handshake completed; waiting for framed packets (magic "
-                    "0x%08X)...",
-                    PACKET_IDENTIFIER,
-                )
+                # Protocol-specific post-subscribe action (handshake or no-op)
+                await proto.after_subscribe(client, write_uuid, write_resp)
 
                 # Step 4: Start connection watchdog
                 self._watchdog = ConnectionWatchdog(
@@ -722,11 +658,9 @@ class PowerWatchdogBLE:
                 elif not client.is_connected:
                     logger.warning(
                         "BLE link dropped for %s (BlueZ/peripheral closed "
-                        "connection); saw_valid_framed_packet=%s "
-                        "rx_buffer_bytes=%d",
+                        "connection); saw_valid_frame=%s",
                         self.address,
                         getattr(self, "_logged_first_valid_frame", False),
-                        len(self._rx_buffer),
                     )
                 else:
                     logger.info(
@@ -782,209 +716,3 @@ class PowerWatchdogBLE:
             pass
         finally:
             self._sleep_task = None
-
-    # ── Notification handling and packet parsing ────────────────────────────
-
-    def _notification_handler(self, _sender, data: bytearray):
-        """Handle incoming BLE notification: buffer and parse framed packets."""
-        cnt = getattr(self, "_rx_notify_log_count", 0)
-        if cnt < _RX_NOTIFY_LOG_MAX:
-            self._rx_notify_log_count = cnt + 1
-            preview = bytes(data[:64]).hex()
-            logger.info(
-                "RX notify #%d: %d bytes from sender=%s; "
-                "first 64 bytes (hex)=%s%s",
-                cnt + 1,
-                len(data),
-                _sender,
-                preview,
-                "..." if len(data) > 64 else "",
-            )
-
-        self._rx_buffer.extend(data)
-
-        # Safety: prevent unbounded buffer growth
-        if len(self._rx_buffer) > MAX_BUFFER_SIZE:
-            logger.warning("RX buffer overflow (%d bytes), clearing", len(self._rx_buffer))
-            self._rx_buffer.clear()
-            return
-
-        # Try to extract complete packets
-        while self._try_parse_packet():
-            pass
-
-    def _try_parse_packet(self) -> bool:
-        """Try to extract and dispatch one complete packet from the RX buffer.
-
-        Returns True if a packet was consumed (even if invalid), False if
-        more data is needed.
-        """
-        buf = self._rx_buffer
-
-        # Scan for the 4-byte identifier
-        while len(buf) >= 4:
-            ident = struct.unpack_from(">I", buf, 0)[0]
-            if ident == PACKET_IDENTIFIER:
-                break
-            # Not at a packet boundary -- skip one byte
-            del buf[0]
-
-        if len(buf) < HEADER_SIZE:
-            return False  # need more data for header
-
-        # Parse header
-        cmd = buf[6]
-        data_len = struct.unpack_from(">H", buf, 7)[0]
-
-        if data_len > MAX_BUFFER_SIZE:
-            logger.warning("Invalid dataLen %d, discarding", data_len)
-            del buf[:4]  # skip past identifier
-            return True
-
-        total_len = HEADER_SIZE + data_len + TAIL_SIZE
-
-        if len(buf) < total_len:
-            return False  # need more data for body + tail
-
-        # Extract body
-        body = bytes(buf[HEADER_SIZE : HEADER_SIZE + data_len])
-
-        # Verify tail
-        tail = struct.unpack_from(">H", buf, HEADER_SIZE + data_len)[0]
-
-        # Save raw hex for debugging before consuming
-        raw_hex = buf[:total_len].hex()
-
-        # Consume this packet from the buffer
-        del buf[:total_len]
-
-        if tail != PACKET_TAIL:
-            if not getattr(self, "_logged_bad_tail", False):
-                self._logged_bad_tail = True
-                hx = raw_hex[:200] + ("..." if len(raw_hex) > 200 else "")
-                logger.warning(
-                    "Bad packet tail 0x%04X (expected 0x%04X); "
-                    "cmd=%d data_len=%d frame_hex_prefix=%s",
-                    tail,
-                    PACKET_TAIL,
-                    cmd,
-                    data_len,
-                    hx,
-                )
-            else:
-                logger.debug(
-                    "Bad packet tail 0x%04X (expected 0x%04X)",
-                    tail,
-                    PACKET_TAIL,
-                )
-            return True  # consumed bytes, try next
-
-        # Valid packet — feed the connection watchdog.
-        # This is the ONLY place it gets fed, proving the device is
-        # sending real, framing-verified data.
-        wd = getattr(self, "_watchdog", None)
-        if wd is not None:
-            wd.notify_activity()
-
-        if not getattr(self, "_logged_first_valid_frame", False):
-            self._logged_first_valid_frame = True
-            logger.info(
-                "First valid framed packet: cmd=%d body_len=%d (magic+tail OK)",
-                cmd,
-                len(body),
-            )
-
-        # Dispatch by command
-        if cmd == CMD_DL_REPORT:
-            self._parse_dl_report(body, raw_hex)
-        elif cmd == CMD_ERROR_REPORT:
-            logger.debug("ErrorReport received (%d bytes body)", len(body))
-        elif cmd == CMD_ALARM:
-            logger.warning("Alarm notification received from Power Watchdog")
-        else:
-            logger.debug("Unknown cmd %d (%d bytes body)", cmd, len(body))
-
-        return True
-
-    def _parse_dl_report(self, body: bytes, raw_hex: str):
-        """Parse a DLReport body (34 bytes = single line, 68 bytes = dual line)."""
-        if len(body) == DL_DATA_SIZE:
-            # 30A single-line or single-leg report
-            l1 = self._parse_dl_data(body, 0)
-            with self._data_lock:
-                self._data.l1 = l1
-                self._data.has_l2 = False
-                self._data.timestamp = time.time()
-                self._data.raw_hex = raw_hex
-            logger.debug(
-                "L1: %.1fV %.2fA %.1fW %.3fkWh %.1fHz err=%d",
-                l1.voltage, l1.current, l1.power,
-                l1.energy, l1.frequency, l1.error_code,
-            )
-
-        elif len(body) == DL_DATA_SIZE * 2:
-            # 50A dual-line report: first 34 bytes = L1, second 34 bytes = L2
-            l1 = self._parse_dl_data(body, 0)
-            l2 = self._parse_dl_data(body, DL_DATA_SIZE)
-            with self._data_lock:
-                self._data.l1 = l1
-                self._data.l2 = l2
-                self._data.has_l2 = True
-                self._data.timestamp = time.time()
-                self._data.raw_hex = raw_hex
-            logger.debug(
-                "L1: %.1fV %.2fA %.1fW | L2: %.1fV %.2fA %.1fW",
-                l1.voltage, l1.current, l1.power,
-                l2.voltage, l2.current, l2.power,
-            )
-
-        else:
-            logger.warning(
-                "Unexpected DLReport body length: %d (expected %d or %d)",
-                len(body), DL_DATA_SIZE, DL_DATA_SIZE * 2,
-            )
-
-    @staticmethod
-    def _parse_dl_data(body: bytes, offset: int) -> LineData:
-        """Parse a single 34-byte DLData block into a LineData object.
-
-        Field layout (all big-endian int32 unless noted):
-            [0:4]   inputVoltage  (/10000 = V)
-            [4:8]   current       (/10000 = A)
-            [8:12]  power         (/10000 = W)
-            [12:16] energy        (/10000 = kWh)
-            [16:20] temp1         (unused)
-            [20:24] outputVoltage (/10000 = V)
-            [24]    backlight     (1 byte)
-            [25]    neutralDetection (1 byte)
-            [26]    boost flag    (1 byte, 1=boosting)
-            [27]    temperature   (1 byte)
-            [28:32] frequency     (/100 = Hz)
-            [32]    error code    (1 byte, 0-9)
-            [33]    status        (1 byte)
-        """
-        o = offset
-        voltage_raw = struct.unpack_from(">i", body, o)[0]
-        current_raw = struct.unpack_from(">i", body, o + 4)[0]
-        power_raw = struct.unpack_from(">i", body, o + 8)[0]
-        energy_raw = struct.unpack_from(">i", body, o + 12)[0]
-        # temp1 at o+16..o+20 (unused)
-        output_v_raw = struct.unpack_from(">i", body, o + 20)[0]
-        # backlight at o+24, neutralDetection at o+25
-        boost = body[o + 26] == 1
-        # temperature at o+27
-        freq_raw = struct.unpack_from(">i", body, o + 28)[0]
-        error_code = body[o + 32]
-        status = body[o + 33]
-
-        return LineData(
-            voltage=voltage_raw / 10000.0,
-            current=current_raw / 10000.0,
-            power=power_raw / 10000.0,
-            energy=energy_raw / 10000.0,
-            output_voltage=output_v_raw / 10000.0,
-            frequency=freq_raw / 100.0,
-            error_code=error_code,
-            status=status,
-            boost=boost,
-        )
