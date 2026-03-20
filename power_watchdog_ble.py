@@ -19,7 +19,13 @@ BLE client for the Hughes Power Watchdog surge protector.
 
 BLE protocol based on prior open-source work by spbrogan and tango2590.
 
-The device uses a framed binary protocol over GATT characteristic 0000ff01.
+The framed binary protocol is the same on all supported hardware, but GATT
+layout differs:
+
+- **Gen2** (WD_* names): one characteristic ``0000ff01`` for notify + write.
+- **Gen1** (PM* names, BT-only): Nordic UART-style ``0000ffe2`` (TX, notify)
+  and ``0000fff5`` (RX, write) under vendor service ``0000ffe0``.
+
 Each BLE notification contains (potentially partial) packet data:
 
     [0x24797740]  4-byte identifier
@@ -49,10 +55,10 @@ DLReport body (cmd=1):
 
 Connection sequence:
   1. Scan and connect (via bleak-connection-manager)
-  2. Subscribe to notifications on 0000ff01
-  3. Request MTU 230
-  4. Send handshake: "!%!%,protocol,open,"
-  5. Parse incoming framed packets
+  2. Subscribe on the notify characteristic (ff01 gen2, or ffe2 gen1)
+  3. Send handshake to the write characteristic (same as notify for gen2,
+     or fff5 RX for gen1): "!%!%,protocol,open,"
+  4. Parse incoming framed packets
 """
 
 import asyncio
@@ -93,8 +99,15 @@ GEN1_PREFIX = "PM"
 
 # ── Protocol constants ──────────────────────────────────────────────────────
 
-# GATT characteristic (same UUID for notify and write)
-CHARACTERISTIC_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
+# Gen2: single characteristic for notify + write
+CHARACTERISTIC_UUID_GEN2 = "0000ff01-0000-1000-8000-00805f9b34fb"
+
+# Gen1 (BT-only): Nordic UART-style TX/RX under 0000ffe0
+CHARACTERISTIC_UUID_GEN1_TX = "0000ffe2-0000-1000-8000-00805f9b34fb"
+CHARACTERISTIC_UUID_GEN1_RX = "0000fff5-0000-1000-8000-00805f9b34fb"
+
+# Backwards-compatible alias — gen2 data path
+CHARACTERISTIC_UUID = CHARACTERISTIC_UUID_GEN2
 
 # Handshake payload: ASCII "!%!%,protocol,open,"
 HANDSHAKE_PAYLOAD = bytes.fromhex("212521252c70726f746f636f6c2c6f70656e2c")
@@ -118,6 +131,72 @@ DL_DATA_SIZE = 34
 # within this window.  Power Watchdog sends updates ~every 30s, so 2 minutes
 # of silence almost certainly means the radio link is dead.
 NOTIFICATION_WATCHDOG_TIMEOUT = 120.0  # seconds
+
+
+def resolve_power_watchdog_gatt(client: BleakClient) -> tuple[str, str, bool, str]:
+    """Map GATT services to notify UUID, write UUID, and write mode.
+
+    Returns:
+        Tuple of ``(notify_uuid, write_uuid, write_with_response, mode)`` where
+        ``mode`` is ``\"gen2\"`` or ``\"gen1_uart\"``.
+
+    Raises:
+        BleakError: If neither known layout is present.
+    """
+    char_props: dict[str, list] = {}
+    for svc in client.services:
+        for char in svc.characteristics:
+            char_props[char.uuid.lower()] = list(char.properties)
+
+    u_g2 = CHARACTERISTIC_UUID_GEN2.lower()
+    if u_g2 in char_props:
+        p = char_props[u_g2]
+        if "notify" in p:
+            use_resp = "write" in p
+            return (
+                CHARACTERISTIC_UUID_GEN2,
+                CHARACTERISTIC_UUID_GEN2,
+                use_resp,
+                "gen2",
+            )
+
+    u_tx = CHARACTERISTIC_UUID_GEN1_TX.lower()
+    u_rx = CHARACTERISTIC_UUID_GEN1_RX.lower()
+    if u_tx in char_props and u_rx in char_props:
+        pt, prx = char_props[u_tx], char_props[u_rx]
+        if "notify" not in pt:
+            pass
+        elif "write-without-response" in prx:
+            return (
+                CHARACTERISTIC_UUID_GEN1_TX,
+                CHARACTERISTIC_UUID_GEN1_RX,
+                False,
+                "gen1_uart",
+            )
+        elif "write" in prx:
+            return (
+                CHARACTERISTIC_UUID_GEN1_TX,
+                CHARACTERISTIC_UUID_GEN1_RX,
+                True,
+                "gen1_uart",
+            )
+
+    found: list[str] = []
+    for svc in client.services:
+        for char in svc.characteristics:
+            found.append(
+                "%s[%s]" % (char.uuid, ",".join(char.properties)),
+            )
+    raise BleakError(
+        "Power Watchdog GATT not recognized: need %s (gen2) or %s+%s (gen1). "
+        "Found: %s"
+        % (
+            CHARACTERISTIC_UUID_GEN2,
+            CHARACTERISTIC_UUID_GEN1_TX,
+            CHARACTERISTIC_UUID_GEN1_RX,
+            "; ".join(found),
+        ),
+    )
 
 
 # ── Data model ──────────────────────────────────────────────────────────────
@@ -479,22 +558,28 @@ class PowerWatchdogBLE:
                             ",".join(char.properties),
                         )
 
-                # Subscribe to notifications
-                logger.info(
-                    "Subscribing to notifications on %s",
-                    CHARACTERISTIC_UUID,
+                notify_uuid, write_uuid, write_resp, gatt_mode = (
+                    resolve_power_watchdog_gatt(client)
                 )
+                logger.info(
+                    "GATT mode %s: notify=%s write=%s (write_response=%s)",
+                    gatt_mode,
+                    notify_uuid,
+                    write_uuid,
+                    write_resp,
+                )
+
+                # Subscribe to notifications
+                logger.info("Subscribing to notifications on %s", notify_uuid)
                 await asyncio.wait_for(
-                    client.start_notify(
-                        CHARACTERISTIC_UUID, self._notification_handler
-                    ),
+                    client.start_notify(notify_uuid, self._notification_handler),
                     timeout=5.0,
                 )
 
                 # Send handshake to start data flow
                 logger.info("Sending handshake...")
                 await client.write_gatt_char(
-                    CHARACTERISTIC_UUID, HANDSHAKE_PAYLOAD, response=True
+                    write_uuid, HANDSHAKE_PAYLOAD, response=write_resp
                 )
                 logger.info("Handshake sent, waiting for data...")
 
@@ -633,8 +718,9 @@ class PowerWatchdogBLE:
         # Valid packet — feed the connection watchdog.
         # This is the ONLY place it gets fed, proving the device is
         # sending real, framing-verified data.
-        if self._watchdog is not None:
-            self._watchdog.notify_activity()
+        wd = getattr(self, "_watchdog", None)
+        if wd is not None:
+            wd.notify_activity()
 
         # Dispatch by command
         if cmd == CMD_DL_REPORT:

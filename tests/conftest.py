@@ -12,13 +12,9 @@ import sys
 import types
 from unittest.mock import MagicMock
 
-# ── Mock bleak ──────────────────────────────────────────────────────────────
-
-_bleak = types.ModuleType("bleak")
-_bleak.BleakClient = MagicMock()
-_bleak.BleakScanner = MagicMock()
-_bleak.BleakError = type("BleakError", (Exception,), {})
-sys.modules.setdefault("bleak", _bleak)
+# ── BLE (bleak + bleak-connection-manager) ────────────────────────────────
+# Real packages from ext/ are used (see pytest.ini pythonpath).  Do not stub
+# ``bleak`` here — a stub shadows the package and breaks BCM imports.
 
 # ── Mock dbus and gi ────────────────────────────────────────────────────────
 

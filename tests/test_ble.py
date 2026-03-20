@@ -20,6 +20,10 @@ from power_watchdog_ble import (
     LineData,
     WatchdogData,
     PowerWatchdogBLE,
+    resolve_power_watchdog_gatt,
+    CHARACTERISTIC_UUID_GEN2,
+    CHARACTERISTIC_UUID_GEN1_TX,
+    CHARACTERISTIC_UUID_GEN1_RX,
     DL_DATA_SIZE,
     PACKET_IDENTIFIER,
     PACKET_TAIL,
@@ -30,6 +34,98 @@ from power_watchdog_ble import (
     CMD_ALARM,
     MAX_BUFFER_SIZE,
 )
+from bleak import BleakError
+
+
+# ── resolve_power_watchdog_gatt ───────────────────────────────────────────
+
+
+class _MockChar:
+    def __init__(self, uuid: str, properties: list[str]):
+        self.uuid = uuid
+        self.properties = properties
+
+
+class _MockSvc:
+    def __init__(self, characteristics: list[_MockChar]):
+        self.characteristics = characteristics
+
+
+class _MockClient:
+    def __init__(self, services: list[_MockSvc]):
+        self.services = services
+
+
+class TestResolvePowerWatchdogGatt:
+    def test_gen2(self):
+        c = _MockClient(
+            [
+                _MockSvc(
+                    [
+                        _MockChar(
+                            CHARACTERISTIC_UUID_GEN2,
+                            ["read", "notify", "write"],
+                        ),
+                    ],
+                ),
+            ],
+        )
+        n, w, resp, mode = resolve_power_watchdog_gatt(c)
+        assert n == w == CHARACTERISTIC_UUID_GEN2
+        assert resp is True
+        assert mode == "gen2"
+
+    def test_gen1_uart(self):
+        c = _MockClient(
+            [
+                _MockSvc(
+                    [
+                        _MockChar(
+                            CHARACTERISTIC_UUID_GEN1_TX,
+                            ["read", "notify"],
+                        ),
+                        _MockChar(
+                            CHARACTERISTIC_UUID_GEN1_RX,
+                            [
+                                "read",
+                                "write-without-response",
+                                "write",
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+        )
+        n, w, resp, mode = resolve_power_watchdog_gatt(c)
+        assert n == CHARACTERISTIC_UUID_GEN1_TX
+        assert w == CHARACTERISTIC_UUID_GEN1_RX
+        assert resp is False
+        assert mode == "gen1_uart"
+
+    def test_gen2_preferred_when_both_present(self):
+        """If ff01 exists with notify, use gen2 even if UART UUIDs also listed."""
+        c = _MockClient(
+            [
+                _MockSvc(
+                    [
+                        _MockChar(
+                            CHARACTERISTIC_UUID_GEN2,
+                            ["notify", "write"],
+                        ),
+                        _MockChar(CHARACTERISTIC_UUID_GEN1_TX, ["notify"]),
+                        _MockChar(CHARACTERISTIC_UUID_GEN1_RX, ["write"]),
+                    ],
+                ),
+            ],
+        )
+        n, w, _, mode = resolve_power_watchdog_gatt(c)
+        assert mode == "gen2"
+        assert n == w == CHARACTERISTIC_UUID_GEN2
+
+    def test_unknown_layout(self):
+        c = _MockClient([_MockSvc([_MockChar("0000180f-0000-1000-8000-00805f9b34fb", ["read"])])])
+        with pytest.raises(BleakError, match="not recognized"):
+            resolve_power_watchdog_gatt(c)
 
 
 # ── Data model defaults ────────────────────────────────────────────────────
