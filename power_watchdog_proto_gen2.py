@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from bleak import BleakClient
     from power_watchdog_ble import PowerWatchdogBLE
 
-from power_watchdog_ble import LineData
+from power_watchdog_ble import LineData, _gen2_has_booster
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,14 @@ class Gen2Protocol:
         """Reset protocol-specific state on the BLE instance for a new connection."""
         ble._rx_buffer = bytearray()
         ble._logged_bad_tail = False
+
+        # Detect booster capability from device name (e.g. "WD_E8_...")
+        ble._has_booster = False
+        if device_name and device_name.startswith("WD_"):
+            parts = device_name.split("_")
+            if len(parts) >= 2:
+                ble._has_booster = _gen2_has_booster(parts[1])
+        logger.info("Gen2 booster capability: %s", ble._has_booster)
 
     def notification_handler(self, ble: PowerWatchdogBLE, _sender, data: bytearray) -> None:
         """Buffer incoming bytes and extract framed packets."""
@@ -182,8 +190,10 @@ class Gen2Protocol:
 
 def _parse_dl_report(ble: PowerWatchdogBLE, body: bytes, raw_hex: str) -> None:
     """Parse a DLReport body (34 bytes = single line, 68 bytes = dual line)."""
+    has_booster = getattr(ble, "_has_booster", False)
+
     if len(body) == DL_DATA_SIZE:
-        l1 = parse_dl_data(body, 0)
+        l1 = parse_dl_data(body, 0, has_booster)
         with ble._data_lock:
             ble._data.l1 = l1
             ble._data.has_l2 = False
@@ -196,8 +206,8 @@ def _parse_dl_report(ble: PowerWatchdogBLE, body: bytes, raw_hex: str) -> None:
         )
 
     elif len(body) == DL_DATA_SIZE * 2:
-        l1 = parse_dl_data(body, 0)
-        l2 = parse_dl_data(body, DL_DATA_SIZE)
+        l1 = parse_dl_data(body, 0, has_booster)
+        l2 = parse_dl_data(body, DL_DATA_SIZE, has_booster)
         with ble._data_lock:
             ble._data.l1 = l1
             ble._data.l2 = l2
@@ -217,7 +227,7 @@ def _parse_dl_report(ble: PowerWatchdogBLE, body: bytes, raw_hex: str) -> None:
         )
 
 
-def parse_dl_data(body: bytes, offset: int) -> LineData:
+def parse_dl_data(body: bytes, offset: int, has_booster: bool = False) -> LineData:
     """Parse a single 34-byte DLData block into a LineData object.
 
     Field layout (all big-endian int32 unless noted):
@@ -226,32 +236,42 @@ def parse_dl_data(body: bytes, offset: int) -> LineData:
         [8:12]  power         (/10000 = W)
         [12:16] energy        (/10000 = kWh)
         [16:20] temp1         (unused)
-        [20:24] outputVoltage (/10000 = V)
+        [20:24] outputVoltage (/10000 = V) — booster models only
         [24]    backlight     (1 byte)
         [25]    neutralDetection (1 byte)
-        [26]    boost flag    (1 byte, 1=boosting)
-        [27]    temperature   (1 byte)
+        [26]    boost flag    (1 byte, 1=boosting) — booster models only
+        [27]    temperature   (1 byte) — booster models only
         [28:32] frequency     (/100 = Hz)
-        [32]    error code    (1 byte, 0-9)
+        [32]    error code    (1 byte, 0-14)
         [33]    status        (1 byte)
+
+    Non-booster models (E5/V5, E6/V6, E7/V7) repurpose the output
+    voltage bytes with the energy counter, so those fields are
+    suppressed (set to defaults) when ``has_booster`` is False.
     """
     o = offset
     voltage_raw = struct.unpack_from(">i", body, o)[0]
     current_raw = struct.unpack_from(">i", body, o + 4)[0]
     power_raw = struct.unpack_from(">i", body, o + 8)[0]
     energy_raw = struct.unpack_from(">i", body, o + 12)[0]
-    output_v_raw = struct.unpack_from(">i", body, o + 20)[0]
-    boost = body[o + 26] == 1
     freq_raw = struct.unpack_from(">i", body, o + 28)[0]
     error_code = body[o + 32]
     status = body[o + 33]
+
+    if has_booster:
+        output_v_raw = struct.unpack_from(">i", body, o + 20)[0]
+        output_voltage = output_v_raw / 10000.0
+        boost = body[o + 26] == 1
+    else:
+        output_voltage = 0.0
+        boost = False
 
     return LineData(
         voltage=voltage_raw / 10000.0,
         current=current_raw / 10000.0,
         power=power_raw / 10000.0,
         energy=energy_raw / 10000.0,
-        output_voltage=output_v_raw / 10000.0,
+        output_voltage=output_voltage,
         frequency=freq_raw / 100.0,
         error_code=error_code,
         status=status,

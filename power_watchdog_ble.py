@@ -243,6 +243,12 @@ class DiscoveredDevice:
     device_type: str = ""  # e.g., "E7" for gen2, "PMD" for gen1 50A
     line_type: str = ""    # "single" (30A) or "double" (50A)
     hw_version: int = 0    # Gen1 only: 1/2/3 from name[15:17] E2/E3/E4
+    has_booster: bool = False  # Gen2 only: E8/V8, E9/V9 have voltage booster
+
+
+def _gen2_has_booster(device_type: str) -> bool:
+    """True for Gen2 models with a voltage booster (E8/V8, E9/V9)."""
+    return len(device_type) == 2 and device_type[1] in ("8", "9")
 
 
 def classify_device(name: str) -> DiscoveredDevice | None:
@@ -273,6 +279,7 @@ def classify_device(name: str) -> DiscoveredDevice | None:
                 generation=2,
                 device_type=device_type,
                 line_type=line_type,
+                has_booster=_gen2_has_booster(device_type),
             )
 
     # Gen1: PM{S|D}... (19 chars, or 27 with trailing spaces)
