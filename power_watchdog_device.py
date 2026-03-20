@@ -124,7 +124,14 @@ class PowerWatchdogDeviceService:
         self._update_interval_ms = update_interval_ms
 
         logger.info("Power Watchdog MAC: %s", self._mac_address)
-        logger.info("BLE adapter: %s", adapter or "auto")
+        ble_adapters = [adapter.strip()] if adapter.strip() else None
+        if ble_adapters:
+            logger.info(
+                "BLE adapter pin (scan + connect): %s",
+                ", ".join(ble_adapters),
+            )
+        else:
+            logger.info("BLE adapter: auto (BCM uses discovered HCIs)")
         logger.info("Update interval: %dms", self._update_interval_ms)
 
         # Start BLE client in daemon thread
@@ -134,6 +141,7 @@ class PowerWatchdogDeviceService:
             reconnect_max_delay=reconnect_max_delay,
             lock_config=LockConfig(enabled=True),
             scan_lock_config=ScanLockConfig(enabled=True),
+            ble_adapters=ble_adapters,
         )
 
         # D-Bus connection

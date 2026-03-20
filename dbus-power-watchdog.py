@@ -176,6 +176,19 @@ class PowerWatchdogService:
         self._reconnect_delay = float(defaults.get("reconnect_delay", str(DEFAULT_RECONNECT_DELAY)))
         self._reconnect_max_delay = float(defaults.get("reconnect_max_delay", str(DEFAULT_RECONNECT_MAX_DELAY)))
 
+        ba_raw = defaults.get("bluetooth_adapters", "").strip()
+        if ba_raw:
+            self._ble_adapters = [
+                x.strip() for x in ba_raw.split(",") if x.strip()
+            ]
+        else:
+            self._ble_adapters = None
+        if self._ble_adapters:
+            logger.info(
+                "BLE adapter pin from config: %s",
+                ", ".join(self._ble_adapters),
+            )
+
         # BCM lock configs for cross-process BLE coordination
         self._lock_config = LockConfig(enabled=True)
         self._scan_lock_config = ScanLockConfig(enabled=True)
@@ -670,6 +683,7 @@ class PowerWatchdogService:
             reconnect_max_delay=self._reconnect_max_delay,
             lock_config=self._lock_config,
             scan_lock_config=self._scan_lock_config,
+            ble_adapters=self._ble_adapters,
         )
 
         # Per-device persistent settings (role, name, position)

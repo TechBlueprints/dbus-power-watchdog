@@ -417,10 +417,13 @@ class PowerWatchdogBLE:
         reconnect_max_delay: float = 120.0,
         lock_config: LockConfig | None = None,
         scan_lock_config: ScanLockConfig | None = None,
+        ble_adapters: list[str] | None = None,
     ):
         self.address = address
         self.reconnect_delay = reconnect_delay
         self.reconnect_max_delay = reconnect_max_delay
+        # Pin scans + connections to these HCIs (e.g. ["hci1"]). None = BCM default.
+        self._ble_adapters = ble_adapters
 
         # BCM lock configs — default to enabled
         self._lock_config = lock_config or LockConfig(enabled=True)
@@ -542,8 +545,21 @@ class PowerWatchdogBLE:
         3. ConnectionWatchdog — detect dead radio links
         """
         delay = self.reconnect_delay
-        adapters = discover_adapters()
-        escalation = EscalationPolicy(adapters, config=EscalationConfig(reset_adapter=False))
+        policy_adapters = (
+            self._ble_adapters
+            if self._ble_adapters
+            else discover_adapters()
+        )
+        if self._ble_adapters:
+            logger.info(
+                "BLE adapter pin active for %s: %s",
+                self.address,
+                ", ".join(self._ble_adapters),
+            )
+        escalation = EscalationPolicy(
+            policy_adapters,
+            config=EscalationConfig(reset_adapter=False),
+        )
 
         while self._running:
             client: BleakClient | None = None
@@ -559,6 +575,7 @@ class PowerWatchdogBLE:
                     self.address,
                     timeout=20.0,
                     max_attempts=3,
+                    adapters=self._ble_adapters,
                     scan_lock_config=self._scan_lock_config,
                 )
 
@@ -585,6 +602,7 @@ class PowerWatchdogBLE:
                     device,
                     "Power Watchdog %s" % self.address,
                     max_attempts=4,
+                    adapters=self._ble_adapters,
                     close_inactive_connections=True,
                     try_direct_first=True,
                     validate_connection=validate_gatt_services,
@@ -696,9 +714,25 @@ class PowerWatchdogBLE:
                     await self._interruptible_sleep(1.0)
 
                 self._connected = False
-                logger.info(
-                    "Disconnecting from Power Watchdog %s...", self.address
-                )
+                if not self._running:
+                    logger.info(
+                        "BLE session end for %s: service stopping",
+                        self.address,
+                    )
+                elif not client.is_connected:
+                    logger.warning(
+                        "BLE link dropped for %s (BlueZ/peripheral closed "
+                        "connection); saw_valid_framed_packet=%s "
+                        "rx_buffer_bytes=%d",
+                        self.address,
+                        getattr(self, "_logged_first_valid_frame", False),
+                        len(self._rx_buffer),
+                    )
+                else:
+                    logger.info(
+                        "Disconnecting from Power Watchdog %s...",
+                        self.address,
+                    )
 
             except Exception:
                 self._connected = False
