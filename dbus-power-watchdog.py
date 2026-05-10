@@ -263,6 +263,15 @@ class PowerWatchdogService:
         self._update_index: int = 0
         self._update_interval_ms: int = DEFAULT_UPDATE_INTERVAL_MS
 
+        # Local cache of the last value we wrote to each grid-meter path.
+        # Lets ``_set_if_changed`` short-circuit on no-op writes without
+        # paying for the ``svc[path] = value`` -> ``__setitem__`` ->
+        # ``_local_set_value`` Python call chain that vedbus would
+        # otherwise walk on every cycle.  Cleared whenever the grid
+        # service is recreated (role change, deactivate) so a fresh
+        # ``VeDbusService`` doesn't inherit stale cache entries.
+        self._last_grid_values: dict[str, object] = {}
+
         # Debounce timer for polling interval slider
         self._poll_debounce_timer_id: int | None = None
         self._poll_debounce_target_ms: int = 0
@@ -760,6 +769,10 @@ class PowerWatchdogService:
             self._grid_bus.close()
             self._grid_bus = None
 
+        # Drop the local write-dedup cache — the new VeDbusService starts
+        # with no stored values, so the first cycle must actually write.
+        self._last_grid_values.clear()
+
         service_class = ROLE_TO_SERVICE.get(role, ROLE_TO_SERVICE["grid"])
         servicename = "%s.power_watchdog_%s" % (service_class, mac_id)
         self._current_role = role
@@ -838,6 +851,7 @@ class PowerWatchdogService:
         if self._grid_service is not None:
             del self._grid_service
             self._grid_service = None
+        self._last_grid_values.clear()
         if self._grid_bus is not None:
             self._grid_bus.close()
             self._grid_bus = None
@@ -898,6 +912,30 @@ class PowerWatchdogService:
 
     # ── Grid update loop ────────────────────────────────────────────────────
 
+    def _set_if_changed(self, svc, path: str, value) -> bool:
+        """Write *value* to *svc[path]* only if our local cache shows
+        the value has changed since our last write.
+
+        Skipping the ``svc[path] = value`` call entirely on no-op writes
+        avoids the ``__setitem__`` -> ``_local_set_value`` -> equality
+        check Python call chain inside vedbus.  vedbus would already
+        return early on a no-op, but the per-call dispatch overhead is
+        non-trivial when ``_update_grid`` runs many times per second
+        across ~15-25 paths.  Caching the last-written value in
+        ``self._last_grid_values`` lets us short-circuit the whole walk.
+
+        The cache is reset whenever the grid service is recreated
+        (``_create_grid_service`` / ``_deactivate_device``), so a fresh
+        VeDbusService never inherits stale entries.
+
+        Returns True iff the write was actually issued.
+        """
+        if self._last_grid_values.get(path) == value:
+            return False
+        self._last_grid_values[path] = value
+        svc[path] = value
+        return True
+
     def _update_grid(self) -> bool:
         """Called periodically to push BLE data to the grid D-Bus service.
 
@@ -912,10 +950,14 @@ class PowerWatchdogService:
         attributed ~5 PC/sec to this single function pre-batching.
 
         Values are rounded with ``_round_to`` to a step coarser than the
-        device's noise floor so vedbus's per-path dedup catches steady
-        readings.  ``/UpdateIndex`` is only bumped (and emitted) when at
-        least one other path actually changed — so when the grid is
-        steady, the IC for that cycle is suppressed entirely.
+        device's noise floor so a steady underlying load produces a
+        steady rounded value.  Each rounded write goes through
+        ``_set_if_changed`` which compares against a local in-RAM cache
+        and skips the vedbus call entirely when unchanged — saving the
+        per-call Python dispatch even on a no-op.  ``/UpdateIndex`` is
+        only bumped (and emitted) when at least one other path actually
+        changed — so when the grid is steady, no writes get through and
+        vedbus suppresses the IC for that cycle entirely.
         """
         if self._ble is None or self._grid_service is None:
             return False  # stop timer
@@ -924,16 +966,23 @@ class PowerWatchdogService:
         connected = self._ble.connected
 
         with self._grid_service as svc:
-            svc["/Connected"] = 1 if connected else 0
+            any_changed = self._set_if_changed(
+                svc, "/Connected", 1 if connected else 0
+            )
 
             if data.timestamp > 0:
                 l1 = data.l1
-                svc["/Ac/L1/Voltage"] = _round_to(l1.voltage, GRID_VOLTAGE_STEP)
-                svc["/Ac/L1/Current"] = _round_to(l1.current, GRID_CURRENT_STEP)
-                svc["/Ac/L1/Power"] = _round_to(l1.power, GRID_POWER_STEP)
-                svc["/Ac/L1/Energy/Forward"] = _round_to(l1.energy, GRID_ENERGY_STEP)
+                any_changed |= self._set_if_changed(
+                    svc, "/Ac/L1/Voltage", _round_to(l1.voltage, GRID_VOLTAGE_STEP))
+                any_changed |= self._set_if_changed(
+                    svc, "/Ac/L1/Current", _round_to(l1.current, GRID_CURRENT_STEP))
+                any_changed |= self._set_if_changed(
+                    svc, "/Ac/L1/Power", _round_to(l1.power, GRID_POWER_STEP))
+                any_changed |= self._set_if_changed(
+                    svc, "/Ac/L1/Energy/Forward", _round_to(l1.energy, GRID_ENERGY_STEP))
                 if l1.frequency > 0:
-                    svc["/Ac/L1/Frequency"] = _round_to(l1.frequency, GRID_FREQ_STEP)
+                    any_changed |= self._set_if_changed(
+                        svc, "/Ac/L1/Frequency", _round_to(l1.frequency, GRID_FREQ_STEP))
 
                 total_power = l1.power
                 total_current = l1.current
@@ -942,43 +991,54 @@ class PowerWatchdogService:
 
                 if data.has_l2:
                     l2 = data.l2
-                    svc["/Ac/L2/Voltage"] = _round_to(l2.voltage, GRID_VOLTAGE_STEP)
-                    svc["/Ac/L2/Current"] = _round_to(l2.current, GRID_CURRENT_STEP)
-                    svc["/Ac/L2/Power"] = _round_to(l2.power, GRID_POWER_STEP)
-                    svc["/Ac/L2/Energy/Forward"] = _round_to(l2.energy, GRID_ENERGY_STEP)
+                    any_changed |= self._set_if_changed(
+                        svc, "/Ac/L2/Voltage", _round_to(l2.voltage, GRID_VOLTAGE_STEP))
+                    any_changed |= self._set_if_changed(
+                        svc, "/Ac/L2/Current", _round_to(l2.current, GRID_CURRENT_STEP))
+                    any_changed |= self._set_if_changed(
+                        svc, "/Ac/L2/Power", _round_to(l2.power, GRID_POWER_STEP))
+                    any_changed |= self._set_if_changed(
+                        svc, "/Ac/L2/Energy/Forward", _round_to(l2.energy, GRID_ENERGY_STEP))
                     if l2.frequency > 0:
-                        svc["/Ac/L2/Frequency"] = _round_to(l2.frequency, GRID_FREQ_STEP)
+                        any_changed |= self._set_if_changed(
+                            svc, "/Ac/L2/Frequency", _round_to(l2.frequency, GRID_FREQ_STEP))
                     total_power += l2.power
                     total_current += l2.current
                     total_energy += l2.energy
                     if l2.error_code > error_code:
                         error_code = l2.error_code
 
-                svc["/NrOfPhases"] = 2 if data.has_l2 else 1
-                svc["/Ac/Power"] = _round_to(total_power, GRID_POWER_STEP)
-                svc["/Ac/Current"] = _round_to(total_current, GRID_CURRENT_STEP)
+                any_changed |= self._set_if_changed(
+                    svc, "/NrOfPhases", 2 if data.has_l2 else 1)
+                any_changed |= self._set_if_changed(
+                    svc, "/Ac/Power", _round_to(total_power, GRID_POWER_STEP))
+                any_changed |= self._set_if_changed(
+                    svc, "/Ac/Current", _round_to(total_current, GRID_CURRENT_STEP))
                 avg_voltage = l1.voltage
                 if data.has_l2 and data.l2.voltage > 0:
                     avg_voltage = (l1.voltage + data.l2.voltage) / 2.0
-                svc["/Ac/Voltage"] = _round_to(avg_voltage, GRID_VOLTAGE_STEP)
+                any_changed |= self._set_if_changed(
+                    svc, "/Ac/Voltage", _round_to(avg_voltage, GRID_VOLTAGE_STEP))
                 if l1.frequency > 0:
-                    svc["/Ac/Frequency"] = _round_to(l1.frequency, GRID_FREQ_STEP)
-                svc["/Ac/Energy/Forward"] = _round_to(total_energy, GRID_ENERGY_STEP)
-                svc["/ErrorCode"] = error_code
-                svc["/ErrorMessage"] = ERROR_MESSAGES.get(
-                    error_code, "Unknown Error %d" % error_code
-                )
+                    any_changed |= self._set_if_changed(
+                        svc, "/Ac/Frequency", _round_to(l1.frequency, GRID_FREQ_STEP))
+                any_changed |= self._set_if_changed(
+                    svc, "/Ac/Energy/Forward", _round_to(total_energy, GRID_ENERGY_STEP))
+                any_changed |= self._set_if_changed(svc, "/ErrorCode", error_code)
+                any_changed |= self._set_if_changed(
+                    svc, "/ErrorMessage",
+                    ERROR_MESSAGES.get(error_code, "Unknown Error %d" % error_code))
 
-                # Only bump /UpdateIndex if at least one other rounded
-                # value actually changed (vedbus's __setitem__ adds the
-                # path to ``svc.changes`` only on a real change).  When
-                # the grid is steady, ``svc.changes`` is empty here,
-                # /UpdateIndex stays put, and vedbus suppresses the IC
+                # Only bump /UpdateIndex if at least one other path
+                # actually went through ``_set_if_changed``.  When the
+                # grid is steady, ``any_changed`` is False here,
+                # /UpdateIndex stays put, vedbus's ``svc.changes`` stays
+                # empty, and the IC for this cycle is suppressed
                 # entirely.  When data does change, /UpdateIndex bumps
                 # and rides along in the same IC.
-                if svc.changes:
+                if any_changed:
                     self._update_index = (self._update_index + 1) % 256
-                    svc["/UpdateIndex"] = self._update_index
+                    self._set_if_changed(svc, "/UpdateIndex", self._update_index)
 
                 # Log inside the ``with`` block so total_power/total_energy
                 # stay in scope.  ``logger.info`` does not touch D-Bus, so
