@@ -59,6 +59,7 @@ from settingsdevice import SettingsDevice  # noqa: E402
 
 from bleak_connection_manager import LockConfig, ScanLockConfig  # noqa: E402
 from power_watchdog_ble import PowerWatchdogBLE, WatchdogData  # noqa: E402
+from grid_publisher import GridPublisher  # noqa: E402
 
 VERSION = "0.6.0"
 
@@ -180,9 +181,13 @@ class PowerWatchdogDeviceService:
 
         # State
         self._dbusservice = None
-        self._update_index = 0
         self._timer_id = None
         self._current_role = None
+
+        # Shared publisher: owns the rolling /UpdateIndex counter and
+        # the in-RAM dedup cache.  Reset on service teardown / role
+        # change so a fresh ``VeDbusService`` starts with empty state.
+        self._grid_publisher = GridPublisher()
 
         # Create the D-Bus service with the persisted role
         role = self._settings["role"]
@@ -275,12 +280,16 @@ class PowerWatchdogDeviceService:
         self._dbusservice.add_path("/Ac/L2/Energy/Reverse", 0)
         self._dbusservice.add_path("/Ac/L2/Frequency", None, gettextcallback=_fmt_hz)
 
-        # Error code
+        # Error code + human-readable message (publisher writes both
+        # when the active service has these paths declared).
         self._dbusservice.add_path("/ErrorCode", 0)
+        self._dbusservice.add_path("/ErrorMessage", "")
 
-        # Update index (0-255, incremented on each update)
-        self._update_index = 0
+        # /UpdateIndex (0-255 rolling counter) — the GridPublisher
+        # owns the actual increment cadence and resets in lockstep
+        # with this service.
         self._dbusservice.add_path("/UpdateIndex", 0)
+        self._grid_publisher.reset()
 
         # Register on D-Bus
         self._dbusservice.register()
@@ -350,71 +359,28 @@ class PowerWatchdogDeviceService:
     # ── Update loop ─────────────────────────────────────────────────────────
 
     def _update(self) -> bool:
-        """Called periodically by GLib to push BLE data to D-Bus."""
+        """Called periodically by GLib to push BLE data to D-Bus.
+
+        Delegates the actual write to ``GridPublisher.publish`` which
+        owns batched writes, coarse rounding, in-RAM dedup, and
+        /UpdateIndex gating — see ``grid_publisher.py``.
+        """
         data = self._ble.get_data()
         connected = self._ble.connected
-
-        self._dbusservice["/Connected"] = 1 if connected else 0
+        self._grid_publisher.publish(self._dbusservice, data, connected)
 
         if data.timestamp > 0:
             l1 = data.l1
-
-            # L1
-            self._dbusservice["/Ac/L1/Voltage"] = round(l1.voltage, 1)
-            self._dbusservice["/Ac/L1/Current"] = round(l1.current, 2)
-            self._dbusservice["/Ac/L1/Power"] = round(l1.power, 0)
-            self._dbusservice["/Ac/L1/Energy/Forward"] = round(l1.energy, 2)
-            if l1.frequency > 0:
-                self._dbusservice["/Ac/L1/Frequency"] = round(l1.frequency, 1)
-
-            total_power = l1.power
-            total_current = l1.current
-            total_energy = l1.energy
-            error_code = l1.error_code
-
             if data.has_l2:
                 l2 = data.l2
-
-                # L2
-                self._dbusservice["/Ac/L2/Voltage"] = round(l2.voltage, 1)
-                self._dbusservice["/Ac/L2/Current"] = round(l2.current, 2)
-                self._dbusservice["/Ac/L2/Power"] = round(l2.power, 0)
-                self._dbusservice["/Ac/L2/Energy/Forward"] = round(l2.energy, 2)
-                if l2.frequency > 0:
-                    self._dbusservice["/Ac/L2/Frequency"] = round(l2.frequency, 1)
-
-                total_power += l2.power
-                total_current += l2.current
-                total_energy += l2.energy
-                if l2.error_code > error_code:
-                    error_code = l2.error_code
-
-            # Phase count (updated from data so 30A=1, 50A=2)
-            self._dbusservice["/NrOfPhases"] = 2 if data.has_l2 else 1
-
-            # Totals
-            self._dbusservice["/Ac/Power"] = round(total_power, 0)
-            self._dbusservice["/Ac/Current"] = round(total_current, 2)
-            avg_voltage = l1.voltage
-            if data.has_l2 and data.l2.voltage > 0:
-                avg_voltage = (l1.voltage + data.l2.voltage) / 2.0
-            self._dbusservice["/Ac/Voltage"] = round(avg_voltage, 1)
-            if l1.frequency > 0:
-                self._dbusservice["/Ac/Frequency"] = round(l1.frequency, 1)
-            self._dbusservice["/Ac/Energy/Forward"] = round(total_energy, 2)
-            self._dbusservice["/ErrorCode"] = error_code
-
-            # Bump update index
-            self._update_index = (self._update_index + 1) % 256
-            self._dbusservice["/UpdateIndex"] = self._update_index
-
-            if data.has_l2:
                 logger.info(
                     "L1: %.1fV %.2fA %.0fW | L2: %.1fV %.2fA %.0fW | "
                     "Total: %.0fW %.2fkWh %.1fHz",
                     l1.voltage, l1.current, l1.power,
-                    data.l2.voltage, data.l2.current, data.l2.power,
-                    total_power, total_energy, l1.frequency,
+                    l2.voltage, l2.current, l2.power,
+                    l1.power + l2.power,
+                    l1.energy + l2.energy,
+                    l1.frequency,
                 )
             else:
                 logger.info(

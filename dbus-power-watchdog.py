@@ -72,6 +72,7 @@ from power_watchdog_ble import (  # noqa: E402
     classify_device,
     DiscoveredDevice,
 )
+from grid_publisher import GridPublisher  # noqa: E402
 
 VERSION = "0.8.0"
 
@@ -100,23 +101,6 @@ DEFAULT_RECONNECT_MAX_DELAY = 120
 # TODO: switch to a generic product ID once gui-v2#2816 is accepted:
 # https://github.com/victronenergy/gui-v2/pull/2816
 PRODUCT_ID_FRONIUS = 0xA142
-
-ERROR_MESSAGES = {
-    0: "",
-    1: "Line 1 Voltage Error",
-    2: "Line 2 Voltage Error",
-    3: "Line 1 Over Current",
-    4: "Line 2 Over Current",
-    5: "Line 1 Neutral Reversed",
-    6: "Line 2 Neutral Reversed",
-    7: "Missing Ground",
-    8: "Neutral Missing",
-    9: "Surge Protection Used Up",
-    11: "Line 1 Frequency Error",
-    12: "Line 2 Frequency Error",
-    13: "Over Temperature",
-    14: "Boost Error",
-}
 
 # Valid roles and their D-Bus service class
 ALLOWED_ROLES = ["grid", "pvinverter", "genset"]
@@ -177,35 +161,6 @@ def _fmt_hz(_path, x):
     return "{:.1f}Hz".format(x) if x is not None else "---"
 
 
-def _round_to(value: float, step: float) -> float:
-    """Round *value* to the nearest multiple of *step*.
-
-    Coarser-than-decimal rounding kills measurement-noise flicker that
-    would otherwise defeat vedbus's per-path "value didn't change"
-    dedup, causing every poll cycle to emit an ItemsChanged signal
-    even when the underlying load is steady.
-
-    Example: a US-grid voltage reading flickering between 119.4 V and
-    119.5 V every cycle survives ``round(x, 1)`` (returns 119.4 vs
-    119.5) but collapses under ``_round_to(x, 0.5)`` (both round to
-    119.5).
-    """
-    if step <= 0:
-        return value
-    return round(value / step) * step
-
-
-# Per-quantity rounding step.  Tuned to the noise floor of the Power
-# Watchdog's reported values: voltages flicker ±0.1 V, currents ±0.01 A,
-# power ±1-2 W when the grid is steady.  Rounding to a multiple of these
-# values lets vedbus's per-path dedup eliminate the flicker.
-GRID_VOLTAGE_STEP = 0.5     # V — grid is 120 V ±5%; 0.5 V resolution still useful
-GRID_CURRENT_STEP = 0.05    # A — kills 10-50 mA noise; 50 mA = ~6 W at 120 V
-GRID_POWER_STEP = 5         # W — kills 1-2 W noise; useful loads are ≥ 5 W anyway
-GRID_FREQ_STEP = 0.1        # Hz — frequency is genuinely stable, no coarsening
-GRID_ENERGY_STEP = 0.01     # kWh — counter, monotone, fine resolution useful
-
-
 # ── Service ─────────────────────────────────────────────────────────────────
 
 class PowerWatchdogService:
@@ -260,17 +215,13 @@ class PowerWatchdogService:
         self._grid_timer_id: int | None = None
         self._grid_settings: SettingsDevice | None = None
         self._current_role: str | None = None
-        self._update_index: int = 0
         self._update_interval_ms: int = DEFAULT_UPDATE_INTERVAL_MS
 
-        # Local cache of the last value we wrote to each grid-meter path.
-        # Lets ``_set_if_changed`` short-circuit on no-op writes without
-        # paying for the ``svc[path] = value`` -> ``__setitem__`` ->
-        # ``_local_set_value`` Python call chain that vedbus would
-        # otherwise walk on every cycle.  Cleared whenever the grid
-        # service is recreated (role change, deactivate) so a fresh
-        # ``VeDbusService`` doesn't inherit stale cache entries.
-        self._last_grid_values: dict[str, object] = {}
+        # Shared publisher: owns the rolling /UpdateIndex counter and
+        # the last-write dedup cache.  Reset whenever the grid service
+        # is destroyed and recreated (role change, deactivate) so a
+        # fresh ``VeDbusService`` doesn't inherit stale cache entries.
+        self._grid_publisher = GridPublisher()
 
         # Debounce timer for polling interval slider
         self._poll_debounce_timer_id: int | None = None
@@ -769,9 +720,10 @@ class PowerWatchdogService:
             self._grid_bus.close()
             self._grid_bus = None
 
-        # Drop the local write-dedup cache — the new VeDbusService starts
-        # with no stored values, so the first cycle must actually write.
-        self._last_grid_values.clear()
+        # The new VeDbusService starts with no stored values, so the
+        # first cycle must actually write — drop the publisher's dedup
+        # cache and reset its rolling /UpdateIndex.
+        self._grid_publisher.reset()
 
         service_class = ROLE_TO_SERVICE.get(role, ROLE_TO_SERVICE["grid"])
         servicename = "%s.power_watchdog_%s" % (service_class, mac_id)
@@ -824,7 +776,8 @@ class PowerWatchdogService:
 
         svc.add_path("/ErrorCode", 0)
         svc.add_path("/ErrorMessage", "")
-        self._update_index = 0
+        # /UpdateIndex starts at 0; the publisher owns the rolling
+        # counter and was already reset above.
         svc.add_path("/UpdateIndex", 0)
 
         svc.register()
@@ -851,7 +804,7 @@ class PowerWatchdogService:
         if self._grid_service is not None:
             del self._grid_service
             self._grid_service = None
-        self._last_grid_values.clear()
+        self._grid_publisher.reset()
         if self._grid_bus is not None:
             self._grid_bus.close()
             self._grid_bus = None
@@ -912,151 +865,40 @@ class PowerWatchdogService:
 
     # ── Grid update loop ────────────────────────────────────────────────────
 
-    def _set_if_changed(self, svc, path: str, value) -> bool:
-        """Write *value* to *svc[path]* only if our local cache shows
-        the value has changed since our last write.
-
-        Skipping the ``svc[path] = value`` call entirely on no-op writes
-        avoids the ``__setitem__`` -> ``_local_set_value`` -> equality
-        check Python call chain inside vedbus.  vedbus would already
-        return early on a no-op, but the per-call dispatch overhead is
-        non-trivial when ``_update_grid`` runs many times per second
-        across ~15-25 paths.  Caching the last-written value in
-        ``self._last_grid_values`` lets us short-circuit the whole walk.
-
-        The cache is reset whenever the grid service is recreated
-        (``_create_grid_service`` / ``_deactivate_device``), so a fresh
-        VeDbusService never inherits stale entries.
-
-        Returns True iff the write was actually issued.
-        """
-        if self._last_grid_values.get(path) == value:
-            return False
-        self._last_grid_values[path] = value
-        svc[path] = value
-        return True
-
     def _update_grid(self) -> bool:
         """Called periodically to push BLE data to the grid D-Bus service.
 
-        All property writes are wrapped in a single ``with self._grid_service``
-        block so VeDbusService's refcounted context manager coalesces the
-        ~12-25 ``__setitem__`` calls into one ``ItemsChanged`` signal per
-        cycle.  Without batching, each write fires its own
-        ``PropertiesChanged`` signal — at the user-configurable poll rate
-        (down to 100 ms) that's up to ~250 signals/sec on the system bus,
-        each fanned out to every D-Bus subscriber (gui-v2, vrmlogger,
-        dbus-systemcalc, mqtt-rpc, …).  A perf audit on a busy Cerbo
-        attributed ~5 PC/sec to this single function pre-batching.
-
-        Values are rounded with ``_round_to`` to a step coarser than the
-        device's noise floor so a steady underlying load produces a
-        steady rounded value.  Each rounded write goes through
-        ``_set_if_changed`` which compares against a local in-RAM cache
-        and skips the vedbus call entirely when unchanged — saving the
-        per-call Python dispatch even on a no-op.  ``/UpdateIndex`` is
-        only bumped (and emitted) when at least one other path actually
-        changed — so when the grid is steady, no writes get through and
-        vedbus suppresses the IC for that cycle entirely.
+        Delegates the actual write to ``GridPublisher.publish`` which
+        owns the four-stage optimization (batched writes, coarse
+        rounding, in-RAM dedup cache, /UpdateIndex gating) — see
+        ``grid_publisher.py``.  We only do the BLE-side glue here:
+        guard against teardown, fetch the latest snapshot, and emit a
+        log line per cycle so operators can see the raw values.
         """
         if self._ble is None or self._grid_service is None:
             return False  # stop timer
 
         data = self._ble.get_data()
         connected = self._ble.connected
+        self._grid_publisher.publish(self._grid_service, data, connected)
 
-        with self._grid_service as svc:
-            any_changed = self._set_if_changed(
-                svc, "/Connected", 1 if connected else 0
-            )
-
-            if data.timestamp > 0:
-                l1 = data.l1
-                any_changed |= self._set_if_changed(
-                    svc, "/Ac/L1/Voltage", _round_to(l1.voltage, GRID_VOLTAGE_STEP))
-                any_changed |= self._set_if_changed(
-                    svc, "/Ac/L1/Current", _round_to(l1.current, GRID_CURRENT_STEP))
-                any_changed |= self._set_if_changed(
-                    svc, "/Ac/L1/Power", _round_to(l1.power, GRID_POWER_STEP))
-                any_changed |= self._set_if_changed(
-                    svc, "/Ac/L1/Energy/Forward", _round_to(l1.energy, GRID_ENERGY_STEP))
-                if l1.frequency > 0:
-                    any_changed |= self._set_if_changed(
-                        svc, "/Ac/L1/Frequency", _round_to(l1.frequency, GRID_FREQ_STEP))
-
-                total_power = l1.power
-                total_current = l1.current
-                total_energy = l1.energy
-                error_code = l1.error_code
-
-                if data.has_l2:
-                    l2 = data.l2
-                    any_changed |= self._set_if_changed(
-                        svc, "/Ac/L2/Voltage", _round_to(l2.voltage, GRID_VOLTAGE_STEP))
-                    any_changed |= self._set_if_changed(
-                        svc, "/Ac/L2/Current", _round_to(l2.current, GRID_CURRENT_STEP))
-                    any_changed |= self._set_if_changed(
-                        svc, "/Ac/L2/Power", _round_to(l2.power, GRID_POWER_STEP))
-                    any_changed |= self._set_if_changed(
-                        svc, "/Ac/L2/Energy/Forward", _round_to(l2.energy, GRID_ENERGY_STEP))
-                    if l2.frequency > 0:
-                        any_changed |= self._set_if_changed(
-                            svc, "/Ac/L2/Frequency", _round_to(l2.frequency, GRID_FREQ_STEP))
-                    total_power += l2.power
-                    total_current += l2.current
-                    total_energy += l2.energy
-                    if l2.error_code > error_code:
-                        error_code = l2.error_code
-
-                any_changed |= self._set_if_changed(
-                    svc, "/NrOfPhases", 2 if data.has_l2 else 1)
-                any_changed |= self._set_if_changed(
-                    svc, "/Ac/Power", _round_to(total_power, GRID_POWER_STEP))
-                any_changed |= self._set_if_changed(
-                    svc, "/Ac/Current", _round_to(total_current, GRID_CURRENT_STEP))
-                avg_voltage = l1.voltage
-                if data.has_l2 and data.l2.voltage > 0:
-                    avg_voltage = (l1.voltage + data.l2.voltage) / 2.0
-                any_changed |= self._set_if_changed(
-                    svc, "/Ac/Voltage", _round_to(avg_voltage, GRID_VOLTAGE_STEP))
-                if l1.frequency > 0:
-                    any_changed |= self._set_if_changed(
-                        svc, "/Ac/Frequency", _round_to(l1.frequency, GRID_FREQ_STEP))
-                any_changed |= self._set_if_changed(
-                    svc, "/Ac/Energy/Forward", _round_to(total_energy, GRID_ENERGY_STEP))
-                any_changed |= self._set_if_changed(svc, "/ErrorCode", error_code)
-                any_changed |= self._set_if_changed(
-                    svc, "/ErrorMessage",
-                    ERROR_MESSAGES.get(error_code, "Unknown Error %d" % error_code))
-
-                # Only bump /UpdateIndex if at least one other path
-                # actually went through ``_set_if_changed``.  When the
-                # grid is steady, ``any_changed`` is False here,
-                # /UpdateIndex stays put, vedbus's ``svc.changes`` stays
-                # empty, and the IC for this cycle is suppressed
-                # entirely.  When data does change, /UpdateIndex bumps
-                # and rides along in the same IC.
-                if any_changed:
-                    self._update_index = (self._update_index + 1) % 256
-                    self._set_if_changed(svc, "/UpdateIndex", self._update_index)
-
-                # Log inside the ``with`` block so total_power/total_energy
-                # stay in scope.  ``logger.info`` does not touch D-Bus, so
-                # leaving the context open for the log call has no effect
-                # on signal timing — ``ItemsChanged`` still fires once at
-                # the outer ``__exit__``.
-                if data.has_l2:
-                    logger.info(
-                        "L1: %.1fV %.2fA %.0fW | L2: %.1fV %.2fA %.0fW | Total: %.0fW %.2fkWh %.1fHz",
-                        l1.voltage, l1.current, l1.power,
-                        data.l2.voltage, data.l2.current, data.l2.power,
-                        total_power, total_energy, l1.frequency,
-                    )
-                else:
-                    logger.info(
-                        "%.1fV %.2fA %.0fW %.2fkWh %.1fHz",
-                        l1.voltage, l1.current, l1.power, l1.energy, l1.frequency,
-                    )
+        if data.timestamp > 0:
+            l1 = data.l1
+            if data.has_l2:
+                l2 = data.l2
+                logger.info(
+                    "L1: %.1fV %.2fA %.0fW | L2: %.1fV %.2fA %.0fW | Total: %.0fW %.2fkWh %.1fHz",
+                    l1.voltage, l1.current, l1.power,
+                    l2.voltage, l2.current, l2.power,
+                    l1.power + l2.power,
+                    l1.energy + l2.energy,
+                    l1.frequency,
+                )
+            else:
+                logger.info(
+                    "%.1fV %.2fA %.0fW %.2fkWh %.1fHz",
+                    l1.voltage, l1.current, l1.power, l1.energy, l1.frequency,
+                )
 
         return True  # keep timer running
 
