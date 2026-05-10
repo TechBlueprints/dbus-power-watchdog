@@ -59,7 +59,7 @@ from settingsdevice import SettingsDevice  # noqa: E402
 
 from bleak_connection_manager import LockConfig, ScanLockConfig  # noqa: E402
 from power_watchdog_ble import PowerWatchdogBLE, WatchdogData  # noqa: E402
-from grid_publisher import GridPublisher  # noqa: E402
+from grid_publisher import ERROR_MESSAGES, GridPublisher  # noqa: E402
 
 VERSION = "0.6.0"
 
@@ -189,6 +189,12 @@ class PowerWatchdogDeviceService:
         # change so a fresh ``VeDbusService`` starts with empty state.
         self._grid_publisher = GridPublisher()
 
+        # Last error code we logged a transition for (sentinel ``None``
+        # means "no data yet", so the first frame logs once as a
+        # confirmation that data is flowing).  Reset alongside the
+        # publisher in lockstep with a service teardown.
+        self._last_logged_error_code: int | None = None
+
         # Create the D-Bus service with the persisted role
         role = self._settings["role"]
         if role not in ALLOWED_ROLES:
@@ -290,6 +296,7 @@ class PowerWatchdogDeviceService:
         # with this service.
         self._dbusservice.add_path("/UpdateIndex", 0)
         self._grid_publisher.reset()
+        self._last_logged_error_code = None
 
         # Register on D-Bus
         self._dbusservice.register()
@@ -369,27 +376,30 @@ class PowerWatchdogDeviceService:
         connected = self._ble.connected
         self._grid_publisher.publish(self._dbusservice, data, connected)
 
+        # Log only on state transitions worth an operator's attention:
+        # the first frame after a (re)connect, and any change in error
+        # code.  Steady-state operation is silent — current values are
+        # available via D-Bus / GUI / VRM.
         if data.timestamp > 0:
-            l1 = data.l1
-            if data.has_l2:
-                l2 = data.l2
-                logger.info(
-                    "L1: %.1fV %.2fA %.0fW | L2: %.1fV %.2fA %.0fW | "
-                    "Total: %.0fW %.2fkWh %.1fHz",
-                    l1.voltage, l1.current, l1.power,
-                    l2.voltage, l2.current, l2.power,
-                    l1.power + l2.power,
-                    l1.energy + l2.energy,
-                    l1.frequency,
-                )
-            else:
-                logger.info(
-                    "%.1fV %.2fA %.0fW %.2fkWh %.1fHz",
-                    l1.voltage, l1.current, l1.power,
-                    l1.energy, l1.frequency,
-                )
-        else:
-            logger.debug("No data yet from Power Watchdog")
+            error_code = data.l1.error_code
+            if data.has_l2 and data.l2.error_code > error_code:
+                error_code = data.l2.error_code
+            if error_code != self._last_logged_error_code:
+                if self._last_logged_error_code is None:
+                    logger.info(
+                        "Data flowing — ErrorCode=%d (%s)",
+                        error_code,
+                        ERROR_MESSAGES.get(error_code,
+                                           "Unknown Error %d" % error_code) or "OK",
+                    )
+                else:
+                    logger.info(
+                        "ErrorCode %d -> %d (%s)",
+                        self._last_logged_error_code, error_code,
+                        ERROR_MESSAGES.get(error_code,
+                                           "Unknown Error %d" % error_code) or "OK",
+                    )
+                self._last_logged_error_code = error_code
 
         return True  # keep timer running
 

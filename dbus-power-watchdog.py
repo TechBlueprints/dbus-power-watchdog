@@ -72,7 +72,7 @@ from power_watchdog_ble import (  # noqa: E402
     classify_device,
     DiscoveredDevice,
 )
-from grid_publisher import GridPublisher  # noqa: E402
+from grid_publisher import ERROR_MESSAGES, GridPublisher  # noqa: E402
 
 VERSION = "0.8.0"
 
@@ -222,6 +222,13 @@ class PowerWatchdogService:
         # is destroyed and recreated (role change, deactivate) so a
         # fresh ``VeDbusService`` doesn't inherit stale cache entries.
         self._grid_publisher = GridPublisher()
+
+        # Last error code we logged a transition for.  ``None`` means
+        # "haven't seen any data yet"; the first published frame logs
+        # the initial code (typically 0) as a confirmation that data
+        # is flowing, then we stay silent until the code actually
+        # changes.  Reset on service teardown.
+        self._last_logged_error_code: int | None = None
 
         # Debounce timer for polling interval slider
         self._poll_debounce_timer_id: int | None = None
@@ -724,6 +731,7 @@ class PowerWatchdogService:
         # first cycle must actually write — drop the publisher's dedup
         # cache and reset its rolling /UpdateIndex.
         self._grid_publisher.reset()
+        self._last_logged_error_code = None
 
         service_class = ROLE_TO_SERVICE.get(role, ROLE_TO_SERVICE["grid"])
         servicename = "%s.power_watchdog_%s" % (service_class, mac_id)
@@ -805,6 +813,7 @@ class PowerWatchdogService:
             del self._grid_service
             self._grid_service = None
         self._grid_publisher.reset()
+        self._last_logged_error_code = None
         if self._grid_bus is not None:
             self._grid_bus.close()
             self._grid_bus = None
@@ -882,23 +891,31 @@ class PowerWatchdogService:
         connected = self._ble.connected
         self._grid_publisher.publish(self._grid_service, data, connected)
 
+        # Log only on state transitions worth an operator's attention:
+        # the first frame after a (re)connect, and any change in error
+        # code.  Steady-state operation is silent — current values are
+        # always available via D-Bus / GUI / VRM.  BLE connect /
+        # disconnect events are logged separately in the BLE thread.
         if data.timestamp > 0:
-            l1 = data.l1
-            if data.has_l2:
-                l2 = data.l2
-                logger.info(
-                    "L1: %.1fV %.2fA %.0fW | L2: %.1fV %.2fA %.0fW | Total: %.0fW %.2fkWh %.1fHz",
-                    l1.voltage, l1.current, l1.power,
-                    l2.voltage, l2.current, l2.power,
-                    l1.power + l2.power,
-                    l1.energy + l2.energy,
-                    l1.frequency,
-                )
-            else:
-                logger.info(
-                    "%.1fV %.2fA %.0fW %.2fkWh %.1fHz",
-                    l1.voltage, l1.current, l1.power, l1.energy, l1.frequency,
-                )
+            error_code = data.l1.error_code
+            if data.has_l2 and data.l2.error_code > error_code:
+                error_code = data.l2.error_code
+            if error_code != self._last_logged_error_code:
+                if self._last_logged_error_code is None:
+                    logger.info(
+                        "Data flowing — ErrorCode=%d (%s)",
+                        error_code,
+                        ERROR_MESSAGES.get(error_code,
+                                           "Unknown Error %d" % error_code) or "OK",
+                    )
+                else:
+                    logger.info(
+                        "ErrorCode %d -> %d (%s)",
+                        self._last_logged_error_code, error_code,
+                        ERROR_MESSAGES.get(error_code,
+                                           "Unknown Error %d" % error_code) or "OK",
+                    )
+                self._last_logged_error_code = error_code
 
         return True  # keep timer running
 
