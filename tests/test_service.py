@@ -190,48 +190,12 @@ class TestLoadConfig:
         assert config["DEFAULT"]["scan_interval"] == "90"
 
 
-# ── Adapter detection ───────────────────────────────────────────────────────
-
-
-class TestDetectAdapters:
-    def test_single_adapter(self):
-        """Single hci0 adapter is detected."""
-        with patch("os.path.isdir", return_value=True):
-            with patch("os.listdir", return_value=["hci0"]):
-                result = pw.PowerWatchdogService._detect_adapters()
-        assert result == ["hci0"]
-
-    def test_multiple_adapters(self, tmp_path):
-        """Multiple adapters are returned in sorted order."""
-        bt_dir = tmp_path / "bluetooth"
-        bt_dir.mkdir()
-        (bt_dir / "hci0").mkdir()
-        (bt_dir / "hci1").mkdir()
-
-        with patch("os.path.isdir", return_value=True):
-            with patch("os.listdir", return_value=["hci1", "hci0"]):
-                result = pw.PowerWatchdogService._detect_adapters()
-        assert result == ["hci0", "hci1"]
-
-    def test_filters_connection_handles(self, tmp_path):
-        """Entries like 'hci0:11' (connection handles) are excluded."""
-        with patch("os.path.isdir", return_value=True):
-            with patch("os.listdir", return_value=["hci0", "hci0:11", "hci1:5"]):
-                result = pw.PowerWatchdogService._detect_adapters()
-        assert result == ["hci0"]
-
-    def test_no_adapters_returns_empty_string(self):
-        """When /sys/class/bluetooth has no hci entries, returns ['']."""
-        with patch("os.path.isdir", return_value=True):
-            with patch("os.listdir", return_value=[]):
-                result = pw.PowerWatchdogService._detect_adapters()
-        assert result == [""]
-
-    def test_no_bluetooth_dir(self):
-        """When /sys/class/bluetooth doesn't exist, returns ['']."""
-        with patch("os.path.isdir", return_value=False):
-            result = pw.PowerWatchdogService._detect_adapters()
-        assert result == [""]
+# Adapter detection used to live in PowerWatchdogService._detect_adapters,
+# scanning /sys/class/bluetooth.  When the project moved to
+# bleak-connection-manager (commit c82b550) BCM took over adapter discovery,
+# and the method was deleted.  The corresponding TestDetectAdapters class
+# was left behind and has been failing on every commit since — removed here
+# alongside other test cleanup.
 
 
 # ── MAC conversion ──────────────────────────────────────────────────────────

@@ -870,72 +870,90 @@ class PowerWatchdogService:
     # ── Grid update loop ────────────────────────────────────────────────────
 
     def _update_grid(self) -> bool:
-        """Called periodically to push BLE data to the grid D-Bus service."""
+        """Called periodically to push BLE data to the grid D-Bus service.
+
+        All property writes are wrapped in a single ``with self._grid_service``
+        block so VeDbusService's refcounted context manager coalesces the
+        ~12-25 ``__setitem__`` calls into one ``ItemsChanged`` signal per
+        cycle.  Without batching, each write fires its own
+        ``PropertiesChanged`` signal — at the user-configurable poll rate
+        (down to 100 ms) that's up to ~250 signals/sec on the system bus,
+        each fanned out to every D-Bus subscriber (gui-v2, vrmlogger,
+        dbus-systemcalc, mqtt-rpc, …).  A perf audit on a busy Cerbo
+        attributed ~5 PC/sec to this single function pre-batching.
+        """
         if self._ble is None or self._grid_service is None:
             return False  # stop timer
 
         data = self._ble.get_data()
         connected = self._ble.connected
-        self._grid_service["/Connected"] = 1 if connected else 0
 
-        if data.timestamp > 0:
-            l1 = data.l1
-            self._grid_service["/Ac/L1/Voltage"] = round(l1.voltage, 1)
-            self._grid_service["/Ac/L1/Current"] = round(l1.current, 2)
-            self._grid_service["/Ac/L1/Power"] = round(l1.power, 0)
-            self._grid_service["/Ac/L1/Energy/Forward"] = round(l1.energy, 2)
-            if l1.frequency > 0:
-                self._grid_service["/Ac/L1/Frequency"] = round(l1.frequency, 1)
+        with self._grid_service as svc:
+            svc["/Connected"] = 1 if connected else 0
 
-            total_power = l1.power
-            total_current = l1.current
-            total_energy = l1.energy
-            error_code = l1.error_code
+            if data.timestamp > 0:
+                l1 = data.l1
+                svc["/Ac/L1/Voltage"] = round(l1.voltage, 1)
+                svc["/Ac/L1/Current"] = round(l1.current, 2)
+                svc["/Ac/L1/Power"] = round(l1.power, 0)
+                svc["/Ac/L1/Energy/Forward"] = round(l1.energy, 2)
+                if l1.frequency > 0:
+                    svc["/Ac/L1/Frequency"] = round(l1.frequency, 1)
 
-            if data.has_l2:
-                l2 = data.l2
-                self._grid_service["/Ac/L2/Voltage"] = round(l2.voltage, 1)
-                self._grid_service["/Ac/L2/Current"] = round(l2.current, 2)
-                self._grid_service["/Ac/L2/Power"] = round(l2.power, 0)
-                self._grid_service["/Ac/L2/Energy/Forward"] = round(l2.energy, 2)
-                if l2.frequency > 0:
-                    self._grid_service["/Ac/L2/Frequency"] = round(l2.frequency, 1)
-                total_power += l2.power
-                total_current += l2.current
-                total_energy += l2.energy
-                if l2.error_code > error_code:
-                    error_code = l2.error_code
+                total_power = l1.power
+                total_current = l1.current
+                total_energy = l1.energy
+                error_code = l1.error_code
 
-            self._grid_service["/NrOfPhases"] = 2 if data.has_l2 else 1
-            self._grid_service["/Ac/Power"] = round(total_power, 0)
-            self._grid_service["/Ac/Current"] = round(total_current, 2)
-            avg_voltage = l1.voltage
-            if data.has_l2 and data.l2.voltage > 0:
-                avg_voltage = (l1.voltage + data.l2.voltage) / 2.0
-            self._grid_service["/Ac/Voltage"] = round(avg_voltage, 1)
-            if l1.frequency > 0:
-                self._grid_service["/Ac/Frequency"] = round(l1.frequency, 1)
-            self._grid_service["/Ac/Energy/Forward"] = round(total_energy, 2)
-            self._grid_service["/ErrorCode"] = error_code
-            self._grid_service["/ErrorMessage"] = ERROR_MESSAGES.get(
-                error_code, "Unknown Error %d" % error_code
-            )
+                if data.has_l2:
+                    l2 = data.l2
+                    svc["/Ac/L2/Voltage"] = round(l2.voltage, 1)
+                    svc["/Ac/L2/Current"] = round(l2.current, 2)
+                    svc["/Ac/L2/Power"] = round(l2.power, 0)
+                    svc["/Ac/L2/Energy/Forward"] = round(l2.energy, 2)
+                    if l2.frequency > 0:
+                        svc["/Ac/L2/Frequency"] = round(l2.frequency, 1)
+                    total_power += l2.power
+                    total_current += l2.current
+                    total_energy += l2.energy
+                    if l2.error_code > error_code:
+                        error_code = l2.error_code
 
-            self._update_index = (self._update_index + 1) % 256
-            self._grid_service["/UpdateIndex"] = self._update_index
-
-            if data.has_l2:
-                logger.info(
-                    "L1: %.1fV %.2fA %.0fW | L2: %.1fV %.2fA %.0fW | Total: %.0fW %.2fkWh %.1fHz",
-                    l1.voltage, l1.current, l1.power,
-                    data.l2.voltage, data.l2.current, data.l2.power,
-                    total_power, total_energy, l1.frequency,
+                svc["/NrOfPhases"] = 2 if data.has_l2 else 1
+                svc["/Ac/Power"] = round(total_power, 0)
+                svc["/Ac/Current"] = round(total_current, 2)
+                avg_voltage = l1.voltage
+                if data.has_l2 and data.l2.voltage > 0:
+                    avg_voltage = (l1.voltage + data.l2.voltage) / 2.0
+                svc["/Ac/Voltage"] = round(avg_voltage, 1)
+                if l1.frequency > 0:
+                    svc["/Ac/Frequency"] = round(l1.frequency, 1)
+                svc["/Ac/Energy/Forward"] = round(total_energy, 2)
+                svc["/ErrorCode"] = error_code
+                svc["/ErrorMessage"] = ERROR_MESSAGES.get(
+                    error_code, "Unknown Error %d" % error_code
                 )
-            else:
-                logger.info(
-                    "%.1fV %.2fA %.0fW %.2fkWh %.1fHz",
-                    l1.voltage, l1.current, l1.power, l1.energy, l1.frequency,
-                )
+
+                self._update_index = (self._update_index + 1) % 256
+                svc["/UpdateIndex"] = self._update_index
+
+                # Log inside the ``with`` block so total_power/total_energy
+                # stay in scope.  ``logger.info`` does not touch D-Bus, so
+                # leaving the context open for the log call has no effect
+                # on signal timing — ``ItemsChanged`` still fires once at
+                # the outer ``__exit__``.
+                if data.has_l2:
+                    logger.info(
+                        "L1: %.1fV %.2fA %.0fW | L2: %.1fV %.2fA %.0fW | Total: %.0fW %.2fkWh %.1fHz",
+                        l1.voltage, l1.current, l1.power,
+                        data.l2.voltage, data.l2.current, data.l2.power,
+                        total_power, total_energy, l1.frequency,
+                    )
+                else:
+                    logger.info(
+                        "%.1fV %.2fA %.0fW %.2fkWh %.1fHz",
+                        l1.voltage, l1.current, l1.power, l1.energy, l1.frequency,
+                    )
 
         return True  # keep timer running
 

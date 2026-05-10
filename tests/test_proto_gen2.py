@@ -138,10 +138,23 @@ class TestParseDlData:
         assert abs(result.power - 12000.0) < 0.01
         assert abs(result.frequency - 50.0) < 0.1
 
-    def test_boost_flag(self):
+    def test_boost_flag_suppressed_for_non_booster(self):
+        # Non-booster models (E5/V5, E6/V6, E7/V7) repurpose byte 26 as
+        # part of the energy counter, so the boost field must be False
+        # regardless of the byte content when has_booster is omitted.
         body = _build_dl_data(boost=True)
         result = parse_dl_data(body, 0)
+        assert result.boost is False
+
+    def test_boost_flag_for_booster_model(self):
+        body = _build_dl_data(boost=True)
+        result = parse_dl_data(body, 0, has_booster=True)
         assert result.boost is True
+
+    def test_boost_clear_for_booster_model(self):
+        body = _build_dl_data(boost=False)
+        result = parse_dl_data(body, 0, has_booster=True)
+        assert result.boost is False
 
     def test_error_code(self):
         body = _build_dl_data(error_code=5)
