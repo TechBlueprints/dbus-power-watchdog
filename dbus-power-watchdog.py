@@ -177,6 +177,35 @@ def _fmt_hz(_path, x):
     return "{:.1f}Hz".format(x) if x is not None else "---"
 
 
+def _round_to(value: float, step: float) -> float:
+    """Round *value* to the nearest multiple of *step*.
+
+    Coarser-than-decimal rounding kills measurement-noise flicker that
+    would otherwise defeat vedbus's per-path "value didn't change"
+    dedup, causing every poll cycle to emit an ItemsChanged signal
+    even when the underlying load is steady.
+
+    Example: a US-grid voltage reading flickering between 119.4 V and
+    119.5 V every cycle survives ``round(x, 1)`` (returns 119.4 vs
+    119.5) but collapses under ``_round_to(x, 0.5)`` (both round to
+    119.5).
+    """
+    if step <= 0:
+        return value
+    return round(value / step) * step
+
+
+# Per-quantity rounding step.  Tuned to the noise floor of the Power
+# Watchdog's reported values: voltages flicker ±0.1 V, currents ±0.01 A,
+# power ±1-2 W when the grid is steady.  Rounding to a multiple of these
+# values lets vedbus's per-path dedup eliminate the flicker.
+GRID_VOLTAGE_STEP = 0.5     # V — grid is 120 V ±5%; 0.5 V resolution still useful
+GRID_CURRENT_STEP = 0.05    # A — kills 10-50 mA noise; 50 mA = ~6 W at 120 V
+GRID_POWER_STEP = 5         # W — kills 1-2 W noise; useful loads are ≥ 5 W anyway
+GRID_FREQ_STEP = 0.1        # Hz — frequency is genuinely stable, no coarsening
+GRID_ENERGY_STEP = 0.01     # kWh — counter, monotone, fine resolution useful
+
+
 # ── Service ─────────────────────────────────────────────────────────────────
 
 class PowerWatchdogService:
@@ -881,6 +910,12 @@ class PowerWatchdogService:
         each fanned out to every D-Bus subscriber (gui-v2, vrmlogger,
         dbus-systemcalc, mqtt-rpc, …).  A perf audit on a busy Cerbo
         attributed ~5 PC/sec to this single function pre-batching.
+
+        Values are rounded with ``_round_to`` to a step coarser than the
+        device's noise floor so vedbus's per-path dedup catches steady
+        readings.  ``/UpdateIndex`` is only bumped (and emitted) when at
+        least one other path actually changed — so when the grid is
+        steady, the IC for that cycle is suppressed entirely.
         """
         if self._ble is None or self._grid_service is None:
             return False  # stop timer
@@ -893,12 +928,12 @@ class PowerWatchdogService:
 
             if data.timestamp > 0:
                 l1 = data.l1
-                svc["/Ac/L1/Voltage"] = round(l1.voltage, 1)
-                svc["/Ac/L1/Current"] = round(l1.current, 2)
-                svc["/Ac/L1/Power"] = round(l1.power, 0)
-                svc["/Ac/L1/Energy/Forward"] = round(l1.energy, 2)
+                svc["/Ac/L1/Voltage"] = _round_to(l1.voltage, GRID_VOLTAGE_STEP)
+                svc["/Ac/L1/Current"] = _round_to(l1.current, GRID_CURRENT_STEP)
+                svc["/Ac/L1/Power"] = _round_to(l1.power, GRID_POWER_STEP)
+                svc["/Ac/L1/Energy/Forward"] = _round_to(l1.energy, GRID_ENERGY_STEP)
                 if l1.frequency > 0:
-                    svc["/Ac/L1/Frequency"] = round(l1.frequency, 1)
+                    svc["/Ac/L1/Frequency"] = _round_to(l1.frequency, GRID_FREQ_STEP)
 
                 total_power = l1.power
                 total_current = l1.current
@@ -907,12 +942,12 @@ class PowerWatchdogService:
 
                 if data.has_l2:
                     l2 = data.l2
-                    svc["/Ac/L2/Voltage"] = round(l2.voltage, 1)
-                    svc["/Ac/L2/Current"] = round(l2.current, 2)
-                    svc["/Ac/L2/Power"] = round(l2.power, 0)
-                    svc["/Ac/L2/Energy/Forward"] = round(l2.energy, 2)
+                    svc["/Ac/L2/Voltage"] = _round_to(l2.voltage, GRID_VOLTAGE_STEP)
+                    svc["/Ac/L2/Current"] = _round_to(l2.current, GRID_CURRENT_STEP)
+                    svc["/Ac/L2/Power"] = _round_to(l2.power, GRID_POWER_STEP)
+                    svc["/Ac/L2/Energy/Forward"] = _round_to(l2.energy, GRID_ENERGY_STEP)
                     if l2.frequency > 0:
-                        svc["/Ac/L2/Frequency"] = round(l2.frequency, 1)
+                        svc["/Ac/L2/Frequency"] = _round_to(l2.frequency, GRID_FREQ_STEP)
                     total_power += l2.power
                     total_current += l2.current
                     total_energy += l2.energy
@@ -920,22 +955,30 @@ class PowerWatchdogService:
                         error_code = l2.error_code
 
                 svc["/NrOfPhases"] = 2 if data.has_l2 else 1
-                svc["/Ac/Power"] = round(total_power, 0)
-                svc["/Ac/Current"] = round(total_current, 2)
+                svc["/Ac/Power"] = _round_to(total_power, GRID_POWER_STEP)
+                svc["/Ac/Current"] = _round_to(total_current, GRID_CURRENT_STEP)
                 avg_voltage = l1.voltage
                 if data.has_l2 and data.l2.voltage > 0:
                     avg_voltage = (l1.voltage + data.l2.voltage) / 2.0
-                svc["/Ac/Voltage"] = round(avg_voltage, 1)
+                svc["/Ac/Voltage"] = _round_to(avg_voltage, GRID_VOLTAGE_STEP)
                 if l1.frequency > 0:
-                    svc["/Ac/Frequency"] = round(l1.frequency, 1)
-                svc["/Ac/Energy/Forward"] = round(total_energy, 2)
+                    svc["/Ac/Frequency"] = _round_to(l1.frequency, GRID_FREQ_STEP)
+                svc["/Ac/Energy/Forward"] = _round_to(total_energy, GRID_ENERGY_STEP)
                 svc["/ErrorCode"] = error_code
                 svc["/ErrorMessage"] = ERROR_MESSAGES.get(
                     error_code, "Unknown Error %d" % error_code
                 )
 
-                self._update_index = (self._update_index + 1) % 256
-                svc["/UpdateIndex"] = self._update_index
+                # Only bump /UpdateIndex if at least one other rounded
+                # value actually changed (vedbus's __setitem__ adds the
+                # path to ``svc.changes`` only on a real change).  When
+                # the grid is steady, ``svc.changes`` is empty here,
+                # /UpdateIndex stays put, and vedbus suppresses the IC
+                # entirely.  When data does change, /UpdateIndex bumps
+                # and rides along in the same IC.
+                if svc.changes:
+                    self._update_index = (self._update_index + 1) % 256
+                    svc["/UpdateIndex"] = self._update_index
 
                 # Log inside the ``with`` block so total_power/total_energy
                 # stay in scope.  ``logger.info`` does not touch D-Bus, so

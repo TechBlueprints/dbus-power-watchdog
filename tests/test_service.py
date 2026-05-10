@@ -101,6 +101,36 @@ class TestFmtHz:
         assert pw._fmt_hz("/Ac/Frequency", None) == "---"
 
 
+# ── Coarse rounding (noise-flicker suppression) ────────────────────────────
+
+
+class TestRoundTo:
+    def test_voltage_half_volt_step_collapses_flicker(self):
+        # The classic noise pattern that motivated this helper: two
+        # consecutive readings 0.1 V apart that round to the same bucket
+        # under a 0.5 V step.
+        assert pw._round_to(119.4, 0.5) == 119.5
+        assert pw._round_to(119.5, 0.5) == 119.5
+
+    def test_current_step(self):
+        assert pw._round_to(0.48, 0.05) == 0.5
+        assert pw._round_to(0.52, 0.05) == 0.5
+
+    def test_power_step(self):
+        assert pw._round_to(9, 5) == 10
+        assert pw._round_to(12, 5) == 10
+        assert pw._round_to(13, 5) == 15
+
+    def test_step_zero_passes_value_through(self):
+        assert pw._round_to(123.456, 0) == 123.456
+
+    def test_step_negative_passes_value_through(self):
+        assert pw._round_to(123.456, -1) == 123.456
+
+    def test_zero_value(self):
+        assert pw._round_to(0.0, 0.5) == 0.0
+
+
 # ── Slider math ─────────────────────────────────────────────────────────────
 # Slider 1-100 maps directly to 100ms-10000ms (100ms per step)
 # POLL_INTERVAL_MS_PER_STEP = 100
