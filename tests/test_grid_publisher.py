@@ -365,6 +365,93 @@ class TestConnectedToggle:
         assert svc.emit_count == e1 + 1
         assert svc._values["/Connected"] == 0
 
+    def test_disconnect_nulls_live_ac_paths(self):
+        """The Hughes Power Watchdog is shore-power-powered — when shore
+        is unplugged the device powers down and stops advertising.
+        Before this behaviour, the publisher kept re-emitting the
+        last-known ``/Ac/L1/Power`` etc., which dbus-systemcalc-py
+        happily summed into the system-wide "AC Loads" reading.  The
+        GUI then showed phantom ~1.5 kW of consumption with nothing
+        actually plugged in.  Verify the live paths now go to None on
+        disconnect so systemcalc excludes them."""
+        svc = FakeVeDbusService()
+        _full_grid_paths(svc)
+        pub = gp.GridPublisher()
+        # First publish a real snapshot while connected — values land.
+        snap = _Snapshot(
+            l1=_Line(voltage=120.0, current=12.5, power=1500.0,
+                     energy=2.5, frequency=60.0),
+            l2=_Line(voltage=123.0, current=0.5, power=75.0,
+                     energy=0.1, frequency=60.0),
+            has_l2=True,
+        )
+        pub.publish(svc, snap, connected=True)
+        assert svc._values["/Ac/L1/Power"] == 1500
+        assert svc._values["/Ac/Power"] == 1575
+
+        # Now disconnect with the same stale snapshot.
+        pub.publish(svc, snap, connected=False)
+
+        # Every live-measurement path is None — systemcalc will skip them.
+        for path in (
+            "/Ac/L1/Voltage", "/Ac/L1/Current", "/Ac/L1/Power",
+            "/Ac/L1/Frequency",
+            "/Ac/L2/Voltage", "/Ac/L2/Current", "/Ac/L2/Power",
+            "/Ac/L2/Frequency",
+            "/Ac/Power", "/Ac/Current", "/Ac/Voltage", "/Ac/Frequency",
+        ):
+            assert svc._values[path] is None, (
+                f"{path} should be None when disconnected, got {svc._values[path]!r}")
+        assert svc._values["/Connected"] == 0
+
+    def test_disconnect_preserves_cumulative_energy(self):
+        """``/Ac/{L1,L2,}/Energy/Forward`` are persistent counters of
+        total energy delivered, not live readings.  Don't blow them
+        away on a transient BLE outage — they represent state that
+        survives the disconnect and the GUI's energy-history panels
+        depend on a monotonically increasing value."""
+        svc = FakeVeDbusService()
+        _full_grid_paths(svc)
+        pub = gp.GridPublisher()
+        snap = _Snapshot(
+            l1=_Line(voltage=120.0, current=10.0, power=1200.0,
+                     energy=42.0, frequency=60.0),
+            l2=_Line(voltage=123.0, current=5.0, power=600.0,
+                     energy=15.0, frequency=60.0),
+            has_l2=True,
+        )
+        pub.publish(svc, snap, connected=True)
+        assert svc._values["/Ac/L1/Energy/Forward"] == pytest.approx(42.0, abs=1)
+        assert svc._values["/Ac/Energy/Forward"] == pytest.approx(57.0, abs=1)
+
+        pub.publish(svc, snap, connected=False)
+        # Energy counters keep their last-known values across the
+        # disconnect rather than being nulled.
+        assert svc._values["/Ac/L1/Energy/Forward"] == pytest.approx(42.0, abs=1)
+        assert svc._values["/Ac/L2/Energy/Forward"] == pytest.approx(15.0, abs=1)
+        assert svc._values["/Ac/Energy/Forward"] == pytest.approx(57.0, abs=1)
+
+    def test_disconnect_repeats_are_deduped(self):
+        """Once the live paths have been nulled, subsequent disconnected
+        publishes should be silent — the local cache notices the
+        target values match what's already on the bus and skips the
+        write.  Avoids spurious ItemsChanged emits while the device
+        remains offline."""
+        svc = FakeVeDbusService()
+        _full_grid_paths(svc)
+        pub = gp.GridPublisher()
+        snap = _Snapshot(
+            l1=_Line(voltage=120.0, current=10.0, power=1200.0),
+        )
+        pub.publish(svc, snap, connected=True)
+        pub.publish(svc, snap, connected=False)
+        e1 = svc.emit_count
+
+        # Second disconnected publish — nothing changes, no emit.
+        any_changed = pub.publish(svc, snap, connected=False)
+        assert any_changed is False
+        assert svc.emit_count == e1
+
 
 # ── reset() clears state ───────────────────────────────────────────────────
 

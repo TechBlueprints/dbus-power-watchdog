@@ -164,12 +164,45 @@ class GridPublisher:
         nothing actually changed, ``/UpdateIndex`` stays put and vedbus
         suppresses the ItemsChanged entirely (empty changes dict).
 
+        When ``connected`` is False, the instantaneous-measurement
+        paths (V / I / P / Frequency on each line and the totals) are
+        explicitly nulled so dbus-systemcalc-py's Grid/Consumption
+        rollup stops aggregating stale readings.  The Hughes Power
+        Watchdog is shore-power-powered — when the user unplugs shore,
+        the device powers down and stops advertising; without this
+        null-on-disconnect the GUI keeps showing the last-known
+        ``/Ac/L1/Power`` (e.g. "AC Loads: 1450 W") forever, which is
+        misleading.  Cumulative energy counters
+        (``/Ac/{L1,L2,}/Energy/Forward``) are preserved across the
+        disconnect because they represent persistent state, not a
+        live measurement.
+
         Returns True iff at least one path was actually written.
         """
         with svc as ctx:
             any_changed = self._set_if_changed(
                 ctx, "/Connected", 1 if connected else 0
             )
+
+            if not connected:
+                # Null out everything that represents a live reading.
+                # vedbus treats None as "no value" and dbus-systemcalc-py
+                # excludes None-valued paths from its sums.
+                for path in (
+                    "/Ac/L1/Voltage", "/Ac/L1/Current", "/Ac/L1/Power",
+                    "/Ac/L1/Frequency",
+                    "/Ac/L2/Voltage", "/Ac/L2/Current", "/Ac/L2/Power",
+                    "/Ac/L2/Frequency",
+                    "/Ac/Power", "/Ac/Current", "/Ac/Voltage",
+                    "/Ac/Frequency",
+                ):
+                    any_changed |= self._set_if_changed(ctx, path, None)
+
+                if any_changed:
+                    self._update_index = (self._update_index + 1) % 256
+                    self._set_if_changed(
+                        ctx, "/UpdateIndex", self._update_index)
+                return any_changed
 
             if data.timestamp > 0:
                 l1 = data.l1
