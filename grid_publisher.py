@@ -75,6 +75,43 @@ GRID_FREQ_STEP = 0.1        # Hz — frequency is genuinely stable, no coarsenin
 GRID_ENERGY_STEP = 0.01     # kWh — counter, monotone, fine resolution useful
 
 
+# /Alarms/* paths surfaced on the grid service.  venus-platform watches
+# these and creates notification slots (Cerbo Notifications pane,
+# flashing-triangle icon).  Severity is 0=OK, 1=Warning, 2=Alarm.
+GRID_ALARM_PATHS: tuple[str, ...] = (
+    "/Alarms/LowVoltage",
+    "/Alarms/HighVoltage",
+    "/Alarms/Overload",
+    "/Alarms/HighTemperature",
+)
+
+
+def _alarms_for_state(error_code: int, input_voltage: float | None) -> dict[str, int]:
+    """Map the current Power Watchdog error code to /Alarms/* severities.
+
+    The error code is the trigger: codes 1 (L1) and 2 (L2) are the
+    device's "voltage error", asserted when input leaves the 104-132 V
+    window.  The DLReport input voltage on the faulting leg tells us
+    which side of the window we left, so we route to LowVoltage or
+    HighVoltage accordingly.  Codes the GUI has no standard /Alarms
+    slot for (5-9, 11-12, 14) surface via /ErrorCode only.
+    """
+    if error_code in (1, 2):
+        if input_voltage is not None and input_voltage > 132:
+            return {"/Alarms/HighVoltage": 2}
+        if input_voltage is not None and input_voltage < 104:
+            return {"/Alarms/LowVoltage": 2}
+        # Trigger fired but voltage outside our window check (e.g.
+        # device cut output and is reporting 0) — default to low,
+        # which is the dominant RV failure mode.
+        return {"/Alarms/LowVoltage": 2}
+    if error_code in (3, 4):
+        return {"/Alarms/Overload": 2}
+    if error_code == 13:
+        return {"/Alarms/HighTemperature": 2}
+    return {}
+
+
 # Map Power Watchdog Gen2 error codes to display strings.  Used for
 # /ErrorMessage where the service exposes that path.  Codes 0 and 10
 # are "no error" / unused; remaining codes from device manual.
@@ -198,6 +235,11 @@ class GridPublisher:
                 ):
                     any_changed |= self._set_if_changed(ctx, path, None)
 
+                # /Alarms/* and /ErrorCode are NOT cleared on disconnect
+                # — the last-known fault is more useful to the user than
+                # a false "all clear" while BLE is dropped.  They'll be
+                # re-evaluated from the next DLReport on reconnect.
+
                 if any_changed:
                     self._update_index = (self._update_index + 1) % 256
                     self._set_if_changed(
@@ -278,6 +320,16 @@ class GridPublisher:
                 any_changed |= self._set_if_changed(
                     ctx, "/ErrorMessage",
                     ERROR_MESSAGES.get(error_code, "Unknown Error %d" % error_code))
+
+                # Pick the faulting line's input voltage so the
+                # low/high split uses the leg that actually tripped.
+                alarm_voltage = l1.voltage
+                if data.has_l2 and data.l2.error_code in (1, 2):
+                    alarm_voltage = data.l2.voltage
+                active_alarms = _alarms_for_state(error_code, alarm_voltage)
+                for path in GRID_ALARM_PATHS:
+                    any_changed |= self._set_if_changed(
+                        ctx, path, active_alarms.get(path, 0))
 
                 if any_changed:
                     self._update_index = (self._update_index + 1) % 256

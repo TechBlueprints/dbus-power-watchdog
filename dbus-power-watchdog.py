@@ -72,7 +72,7 @@ from power_watchdog_ble import (  # noqa: E402
     classify_device,
     DiscoveredDevice,
 )
-from grid_publisher import ERROR_MESSAGES, GridPublisher  # noqa: E402
+from grid_publisher import ERROR_MESSAGES, GRID_ALARM_PATHS, GridPublisher  # noqa: E402
 
 VERSION = "0.8.0"
 
@@ -784,6 +784,11 @@ class PowerWatchdogService:
 
         svc.add_path("/ErrorCode", 0)
         svc.add_path("/ErrorMessage", "")
+
+        # /Alarms/* paths: venus-platform watches these and creates
+        # Notifications-pane entries.  0=OK, 1=Warning, 2=Alarm.
+        for alarm_path in GRID_ALARM_PATHS:
+            svc.add_path(alarm_path, 0)
         # /UpdateIndex starts at 0; the publisher owns the rolling
         # counter and was already reset above.
         svc.add_path("/UpdateIndex", 0)

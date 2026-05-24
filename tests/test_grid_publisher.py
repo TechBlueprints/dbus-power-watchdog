@@ -139,6 +139,8 @@ def _full_grid_paths(svc: FakeVeDbusService, *, with_error_message: bool = True)
         svc.add_path(p)
     if with_error_message:
         svc.add_path("/ErrorMessage")
+    for alarm_path in gp.GRID_ALARM_PATHS:
+        svc.add_path(alarm_path, 0)
 
 
 # ── Round-to helper (delegates to existing TestRoundTo in test_service.py
@@ -511,6 +513,95 @@ class TestOptionalErrorMessagePath:
 
 
 # ── No data yet (timestamp == 0) ───────────────────────────────────────────
+
+
+class TestAlarms:
+    def test_undervoltage_trip_sets_low_voltage_alarm(self):
+        svc = FakeVeDbusService()
+        _full_grid_paths(svc)
+        pub = gp.GridPublisher()
+        # Device tripped on L1 with input voltage below 104 V.
+        snap = _Snapshot(l1=_Line(voltage=98.0, current=0.0, power=0.0,
+                                  error_code=1))
+        pub.publish(svc, snap, connected=True)
+        assert svc._values["/Alarms/LowVoltage"] == 2
+        assert svc._values["/Alarms/HighVoltage"] == 0
+
+    def test_overvoltage_trip_sets_high_voltage_alarm(self):
+        svc = FakeVeDbusService()
+        _full_grid_paths(svc)
+        pub = gp.GridPublisher()
+        # Device tripped on L1 with input voltage above 132 V.
+        snap = _Snapshot(l1=_Line(voltage=140.0, current=0.0, power=0.0,
+                                  error_code=1))
+        pub.publish(svc, snap, connected=True)
+        assert svc._values["/Alarms/HighVoltage"] == 2
+        assert svc._values["/Alarms/LowVoltage"] == 0
+
+    def test_l2_voltage_trip_uses_l2_input_voltage(self):
+        svc = FakeVeDbusService()
+        _full_grid_paths(svc)
+        pub = gp.GridPublisher()
+        # L1 happy at 120 V, L2 tripped low at 100 V — direction must
+        # be picked from the faulting leg, not L1.
+        snap = _Snapshot(
+            l1=_Line(voltage=120.0, current=10.0, power=1200.0, error_code=0),
+            l2=_Line(voltage=100.0, current=0.0, power=0.0, error_code=2),
+            has_l2=True,
+        )
+        pub.publish(svc, snap, connected=True)
+        assert svc._values["/ErrorCode"] == 2
+        assert svc._values["/Alarms/LowVoltage"] == 2
+
+    def test_overcurrent_sets_overload_alarm(self):
+        svc = FakeVeDbusService()
+        _full_grid_paths(svc)
+        pub = gp.GridPublisher()
+        snap = _Snapshot(l1=_Line(voltage=120.0, current=35.0, power=4200.0,
+                                  error_code=3))
+        pub.publish(svc, snap, connected=True)
+        assert svc._values["/Alarms/Overload"] == 2
+
+    def test_alarm_clears_when_error_returns_to_zero(self):
+        svc = FakeVeDbusService()
+        _full_grid_paths(svc)
+        pub = gp.GridPublisher()
+        # Trip
+        pub.publish(svc, _Snapshot(l1=_Line(voltage=98.0, error_code=1)),
+                    connected=True)
+        assert svc._values["/Alarms/LowVoltage"] == 2
+        # Recover
+        pub.publish(svc, _Snapshot(l1=_Line(voltage=120.0, current=10.0,
+                                            power=1200.0, error_code=0)),
+                    connected=True)
+        assert svc._values["/Alarms/LowVoltage"] == 0
+        assert svc._values["/ErrorCode"] == 0
+
+    def test_alarms_persist_across_disconnect(self):
+        # Matches /ErrorCode behaviour: a known-tripped state survives
+        # a BLE drop so the user keeps seeing the alarm until either
+        # the device recovers or they take action.
+        svc = FakeVeDbusService()
+        _full_grid_paths(svc)
+        pub = gp.GridPublisher()
+        pub.publish(svc, _Snapshot(l1=_Line(voltage=98.0, error_code=1)),
+                    connected=True)
+        assert svc._values["/Alarms/LowVoltage"] == 2
+        pub.publish(svc, _Snapshot(timestamp=0.0), connected=False)
+        assert svc._values["/Alarms/LowVoltage"] == 2
+
+    def test_unrelated_error_codes_leave_alarms_at_zero(self):
+        svc = FakeVeDbusService()
+        _full_grid_paths(svc)
+        pub = gp.GridPublisher()
+        # Surge-protection-used-up (9) — no /Alarms slot in the GUI
+        # spec; surfaces via /ErrorCode only.
+        snap = _Snapshot(l1=_Line(voltage=120.0, current=10.0, power=1200.0,
+                                  error_code=9))
+        pub.publish(svc, snap, connected=True)
+        assert svc._values["/ErrorCode"] == 9
+        for alarm_path in gp.GRID_ALARM_PATHS:
+            assert svc._values[alarm_path] == 0
 
 
 class TestPreData:
