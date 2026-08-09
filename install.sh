@@ -145,7 +145,7 @@ echo ""
 
 # Step 5: Start or restart service
 echo "Step 5: Starting service..."
-if svstat "/service/$SERVICE_NAME" 2>/dev/null | grep -q "up"; then
+if svstat "/service/$SERVICE_NAME" 2>/dev/null | grep -q ": up "; then
     if [ "$NEEDS_RESTART" = true ]; then
         echo "Restarting service to apply updates..."
         svc -t "/service/$SERVICE_NAME"
