@@ -41,6 +41,7 @@ import platform
 import signal
 import sys
 import threading
+import time
 import xml.etree.ElementTree as ET
 
 import dbus
@@ -93,6 +94,12 @@ POLL_INTERVAL_MS_PER_STEP = 100
 # Default reconnect parameters for the BLE client
 DEFAULT_RECONNECT_DELAY = 10
 DEFAULT_RECONNECT_MAX_DELAY = 120
+
+# How long the BLE thread may show no progress at all — neither a connect
+# attempt nor a telemetry frame — before we exit and let runit restart us.
+# Comfortably longer than PowerWatchdogBLE.OFFLINE_POLL_INTERVAL (300 s) so
+# an unplugged unit never trips it.  See _check_ble_liveness().
+BLE_LIVENESS_TIMEOUT = 900.0
 
 # Fronius PV-inverter ProductId (0xA142).  We use this so the Venus OS GUI
 # displays our /ErrorCode — ListAcInError.qml only shows the error row for
@@ -229,6 +236,11 @@ class PowerWatchdogService:
         # is flowing, then we stay silent until the code actually
         # changes.  Reset on service teardown.
         self._last_logged_error_code: int | None = None
+
+        # BLE liveness tracking — see _check_ble_liveness().
+        self._last_ble_cycles: int = -1
+        self._last_data_timestamp: float = 0.0
+        self._last_ble_progress: float = time.monotonic()
 
         # Debounce timer for polling interval slider
         self._poll_debounce_timer_id: int | None = None
@@ -697,6 +709,12 @@ class PowerWatchdogService:
             ble_adapters=self._ble_adapters,
         )
 
+        # Fresh BLE object: its cycle counter restarts at zero, so clear the
+        # liveness baseline rather than comparing against the old device's.
+        self._last_ble_cycles = -1
+        self._last_data_timestamp = 0.0
+        self._last_ble_progress = time.monotonic()
+
         # Per-device persistent settings (role, name, position)
         settings_path = "/Settings/Devices/power_watchdog_%s" % mac_id
         self._grid_settings = SettingsDevice(
@@ -895,6 +913,7 @@ class PowerWatchdogService:
         data = self._ble.get_data()
         connected = self._ble.connected
         self._grid_publisher.publish(self._grid_service, data, connected)
+        self._check_ble_liveness(data)
 
         # Log only on state transitions worth an operator's attention:
         # the first frame after a (re)connect, and any change in error
@@ -923,6 +942,62 @@ class PowerWatchdogService:
                 self._last_logged_error_code = error_code
 
         return True  # keep timer running
+
+    def _check_ble_liveness(self, data) -> None:
+        """Exit nonzero if the BLE thread has stopped making progress.
+
+        Last-resort backstop.  Everything in ``power_watchdog_ble`` that
+        detects a dead link runs inside the BLE thread, so none of it
+        helps if that thread is itself wedged.  Restarting the process is
+        the only way to clear state we do not own: bleak's cached
+        connection flags, the asyncio loop, BlueZ client handles.
+
+        Two independent signals must *both* go quiet before we give up:
+
+        * ``connect_cycles`` frozen — the session loop is not iterating,
+          so it is neither reconnecting nor polling for an offline unit.
+        * no fresh telemetry — nothing arriving on an open session.
+
+        Either one alone is normal, which is what keeps this from
+        restart-looping a rig that is simply unplugged.  A healthy
+        connected device sits in one long session with a frozen counter
+        while data streams; an unplugged one produces no data but still
+        advances the counter every ``OFFLINE_POLL_INTERVAL``.  Only both
+        at once means wedged.
+        """
+        now = time.monotonic()
+        progressed = False
+
+        # Record both signals every tick. Short-circuiting on the first one
+        # would leave the other's baseline stale, and a stale baseline reads
+        # as fresh progress on the following tick.
+        cycles = self._ble.connect_cycles
+        if cycles != self._last_ble_cycles:
+            self._last_ble_cycles = cycles
+            progressed = True
+
+        if data.timestamp > self._last_data_timestamp:
+            self._last_data_timestamp = data.timestamp
+            progressed = True
+
+        if progressed:
+            self._last_ble_progress = now
+            return
+
+        stalled = now - self._last_ble_progress
+        if stalled < BLE_LIVENESS_TIMEOUT:
+            return
+
+        logger.error(
+            "BLE thread has made no progress for %.0fs — no connect "
+            "attempts and no telemetry. Exiting so runit restarts us.",
+            stalled,
+        )
+        logging.shutdown()
+        # _exit, not sys.exit: SystemExit raised inside a GLib callback
+        # gets swallowed by the main loop, and a wedged thread is exactly
+        # the case where an orderly shutdown cannot be relied on.
+        os._exit(1)
 
     # ── Settings persistence ────────────────────────────────────────────────
 

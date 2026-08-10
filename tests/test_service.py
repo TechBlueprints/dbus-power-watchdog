@@ -266,3 +266,106 @@ class TestConstants:
         assert len(parts) == 3
         for p in parts:
             assert p.isdigit()
+
+
+# ── BLE liveness backstop ─────────────────────────────────────────────────
+#
+# _check_ble_liveness exits the process so runit restarts it.  The risk is
+# not that it fails to fire but that it fires when it shouldn't: a rig with
+# shore power unplugged is silent for days and must never restart-loop.
+
+
+class _FakeBle:
+    def __init__(self, cycles: int = 0):
+        self.connect_cycles = cycles
+
+
+class _FakeData:
+    def __init__(self, timestamp: float = 0.0):
+        self.timestamp = timestamp
+
+
+def _liveness_svc(cycles: int = 0):
+    """A bare service object carrying only the liveness state."""
+    svc = object.__new__(pw.PowerWatchdogService)
+    svc._ble = _FakeBle(cycles)
+    svc._last_ble_cycles = -1
+    svc._last_data_timestamp = 0.0
+    svc._last_ble_progress = pw.time.monotonic()
+    return svc
+
+
+class TestBleLiveness:
+    def test_timeout_exceeds_offline_poll_interval(self):
+        # The guard rail: an unplugged unit wakes every OFFLINE_POLL_INTERVAL
+        # to poll, so the liveness window must be comfortably longer or a
+        # legitimately offline rig would restart-loop forever.
+        from power_watchdog_ble import PowerWatchdogBLE
+
+        assert pw.BLE_LIVENESS_TIMEOUT > PowerWatchdogBLE.OFFLINE_POLL_INTERVAL
+
+    def test_advancing_cycles_resets_progress(self, monkeypatch):
+        # Offline device: no data ever, but the session loop keeps polling.
+        exited = []
+        monkeypatch.setattr(pw.os, "_exit", lambda code: exited.append(code))
+
+        svc = _liveness_svc(cycles=1)
+        svc._last_ble_progress = pw.time.monotonic() - 10_000
+
+        svc._check_ble_liveness(_FakeData(timestamp=0.0))
+
+        assert exited == []
+        assert pw.time.monotonic() - svc._last_ble_progress < 5
+
+    def test_offline_device_never_exits_over_many_polls(self, monkeypatch):
+        exited = []
+        monkeypatch.setattr(pw.os, "_exit", lambda code: exited.append(code))
+
+        svc = _liveness_svc(cycles=0)
+        for i in range(1, 50):
+            svc._ble.connect_cycles = i
+            # Pretend each poll happened a full offline interval apart.
+            svc._last_ble_progress -= 300.0
+            svc._check_ble_liveness(_FakeData(timestamp=0.0))
+
+        assert exited == []
+
+    def test_flowing_data_with_frozen_cycles_does_not_exit(self, monkeypatch):
+        # Healthy connected device: one long session, so the cycle counter
+        # is frozen for hours while telemetry streams.
+        exited = []
+        monkeypatch.setattr(pw.os, "_exit", lambda code: exited.append(code))
+
+        svc = _liveness_svc(cycles=7)
+        svc._check_ble_liveness(_FakeData(timestamp=100.0))
+        svc._last_ble_progress = pw.time.monotonic() - 10_000
+        svc._check_ble_liveness(_FakeData(timestamp=200.0))
+
+        assert exited == []
+
+    def test_both_signals_frozen_exits_nonzero(self, monkeypatch):
+        # The wedge: no connect attempts and no telemetry.
+        exited = []
+        monkeypatch.setattr(pw.os, "_exit", lambda code: exited.append(code))
+
+        svc = _liveness_svc(cycles=7)
+        svc._check_ble_liveness(_FakeData(timestamp=100.0))
+        svc._last_ble_progress = pw.time.monotonic() - (
+            pw.BLE_LIVENESS_TIMEOUT + 1
+        )
+        svc._check_ble_liveness(_FakeData(timestamp=100.0))
+
+        assert exited == [1]
+
+    def test_frozen_but_within_window_does_not_exit(self, monkeypatch):
+        exited = []
+        monkeypatch.setattr(pw.os, "_exit", lambda code: exited.append(code))
+
+        svc = _liveness_svc(cycles=7)
+        svc._check_ble_liveness(_FakeData(timestamp=100.0))
+        svc._last_ble_progress = pw.time.monotonic() - (
+            pw.BLE_LIVENESS_TIMEOUT - 30
+        )
+        svc._check_ble_liveness(_FakeData(timestamp=100.0))
+
+        assert exited == []

@@ -347,3 +347,83 @@ class TestClassifyDevice:
 
     def test_pm_prefix_not_19_chars(self):
         assert classify_device("PMD12345") is None
+
+
+# ── Session liveness (the 2026-08-09 wedge) ───────────────────────────────
+#
+# The service sat wedged for four hours because the ConnectionWatchdog died
+# (its sync callback was awaited and raised TypeError) while the session loop
+# spun on a stale ``client.is_connected``.  These cover the two independent
+# guards added so neither failure alone can wedge it again.
+
+
+import asyncio
+import time as _time
+
+from power_watchdog_ble import NOTIFICATION_WATCHDOG_TIMEOUT, PowerWatchdogBLE
+
+
+class _FakeWatchdog:
+    def __init__(self, last_activity: float):
+        self.last_activity = last_activity
+
+
+def _bare_ble() -> PowerWatchdogBLE:
+    """A PowerWatchdogBLE without running __init__ (which starts a thread)."""
+    ble = object.__new__(PowerWatchdogBLE)
+    ble.address = "AA:BB:CC:DD:EE:FF"
+    ble._watchdog = None
+    ble._connected = True
+    ble._reconnect_requested = False
+    ble._sleep_task = None
+    return ble
+
+
+class TestDataIsStale:
+    def test_no_watchdog_is_not_stale(self):
+        # Before a session is established there is nothing to be stale.
+        assert _bare_ble()._data_is_stale() is False
+
+    def test_fresh_activity_is_not_stale(self):
+        ble = _bare_ble()
+        ble._watchdog = _FakeWatchdog(_time.monotonic())
+        assert ble._data_is_stale() is False
+
+    def test_just_inside_limit_is_not_stale(self):
+        ble = _bare_ble()
+        limit = NOTIFICATION_WATCHDOG_TIMEOUT * PowerWatchdogBLE.STALE_DATA_FACTOR
+        ble._watchdog = _FakeWatchdog(_time.monotonic() - (limit - 5))
+        assert ble._data_is_stale() is False
+
+    def test_beyond_limit_is_stale(self):
+        ble = _bare_ble()
+        limit = NOTIFICATION_WATCHDOG_TIMEOUT * PowerWatchdogBLE.STALE_DATA_FACTOR
+        ble._watchdog = _FakeWatchdog(_time.monotonic() - (limit + 5))
+        assert ble._data_is_stale() is True
+
+    def test_stale_limit_exceeds_watchdog_timeout(self):
+        # The inline check must be the backstop, never the fast path —
+        # otherwise it would pre-empt the watchdog's own recovery.
+        assert PowerWatchdogBLE.STALE_DATA_FACTOR > 1.0
+
+
+class TestWatchdogTimeoutCallback:
+    def test_callback_is_a_coroutine_function(self):
+        # BCM awaits the return value. A plain def returns None, and
+        # `await None` is the TypeError that killed the watchdog.
+        assert asyncio.iscoroutinefunction(
+            PowerWatchdogBLE._on_watchdog_timeout
+        )
+
+    def test_callback_requests_reconnect(self):
+        ble = _bare_ble()
+        asyncio.run(ble._on_watchdog_timeout())
+        assert ble._reconnect_requested is True
+        assert ble._connected is False
+
+    def test_callback_survives_no_sleep_task(self):
+        # Fires between sleeps: _cancel_sleep must not raise.
+        ble = _bare_ble()
+        ble._sleep_task = None
+        asyncio.run(ble._on_watchdog_timeout())
+        assert ble._reconnect_requested is True

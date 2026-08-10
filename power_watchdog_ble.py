@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 
 from bleak import BleakClient, BleakError
 from bleak.backends.device import BLEDevice
+from bleak_retry_connector import BleakNotFoundError
 
 from bleak_connection_manager import (
     ConnectionWatchdog,
@@ -379,6 +380,10 @@ class PowerWatchdogBLE:
     # The device may be unplugged and will come back at any time.
     OFFLINE_POLL_INTERVAL = 300.0  # 5 minutes
 
+    # Multiple of NOTIFICATION_WATCHDOG_TIMEOUT after which the session
+    # loop tears down on its own, without waiting for the watchdog.
+    STALE_DATA_FACTOR = 1.5
+
     def __init__(
         self,
         address: str,
@@ -403,6 +408,21 @@ class PowerWatchdogBLE:
         self._connected = False
         self._running = True
 
+        # Set by the notification watchdog to tear the session down. The
+        # session loop cannot key off client.is_connected: BCM's watchdog
+        # cleanup calls remove_device(), which leaves bleak's cached
+        # connection state stale forever (documented in ConnectionWatchdog).
+        self._reconnect_requested = False
+
+        # Consecutive "found by scan, gone by connect" failures. BCM raises
+        # BleakNotFoundError immediately rather than retrying, so the first
+        # one is treated as a blip and only a repeat concedes it is offline.
+        self._notfound_streak = 0
+
+        # Advances once per session-loop iteration. Read by the daemon as a
+        # liveness signal — see the connect_cycles property.
+        self._connect_cycles = 0
+
         # asyncio event loop reference (set by daemon thread)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._sleep_task: asyncio.Task | None = None
@@ -421,6 +441,19 @@ class PowerWatchdogBLE:
     @property
     def connected(self) -> bool:
         return self._connected
+
+    @property
+    def connect_cycles(self) -> int:
+        """Number of session-loop iterations so far.
+
+        Advances once per connect attempt, including the slow poll while
+        the unit is offline. A frozen counter combined with stale telemetry
+        is how the daemon tells a wedged BLE thread from a device that is
+        simply unplugged: an unplugged unit still advances this every
+        ``OFFLINE_POLL_INTERVAL``, and a healthy connected one sits in a
+        single long session with a frozen counter but flowing data.
+        """
+        return self._connect_cycles
 
     def get_data(self) -> WatchdogData:
         """Return a snapshot of the latest data (thread-safe)."""
@@ -536,6 +569,11 @@ class PowerWatchdogBLE:
         while self._running:
             client: BleakClient | None = None
             device: BLEDevice | None = None
+            # Set by handlers that own their own retry cadence; None means
+            # fall through to the generic disconnect backoff.
+            next_delay: float | None = None
+            self._reconnect_requested = False
+            self._connect_cycles += 1
 
             try:
                 # Step 1: Find the device via managed scan
@@ -585,6 +623,7 @@ class PowerWatchdogBLE:
                     self.address, client.mtu_size,
                 )
                 self._connected = True
+                self._notfound_streak = 0
                 delay = self.reconnect_delay
 
                 n_svc = sum(1 for _ in client.services)
@@ -649,8 +688,15 @@ class PowerWatchdogBLE:
                 )
                 self._watchdog.start()
 
-                # Step 5: Stay connected while client is alive
-                while client.is_connected and self._running:
+                # Step 5: Stay connected while data is actually flowing.
+                # client.is_connected alone is not a safe liveness signal —
+                # it stays True after BCM's remove_device() cleanup.
+                while (
+                    client.is_connected
+                    and self._running
+                    and not self._reconnect_requested
+                    and not self._data_is_stale()
+                ):
                     await self._interruptible_sleep(1.0)
 
                 self._connected = False
@@ -658,6 +704,18 @@ class PowerWatchdogBLE:
                     logger.info(
                         "BLE session end for %s: service stopping",
                         self.address,
+                    )
+                elif self._reconnect_requested:
+                    logger.warning(
+                        "BLE session end for %s: watchdog forced reconnect",
+                        self.address,
+                    )
+                elif self._data_is_stale():
+                    logger.warning(
+                        "BLE session end for %s: no notifications for over "
+                        "%.0fs and the watchdog never fired",
+                        self.address,
+                        NOTIFICATION_WATCHDOG_TIMEOUT * self.STALE_DATA_FACTOR,
                     )
                 elif not client.is_connected:
                     logger.warning(
@@ -670,6 +728,26 @@ class PowerWatchdogBLE:
                         "Disconnecting from Power Watchdog %s...",
                         self.address,
                     )
+
+            except BleakNotFoundError:
+                # The scan found the device but it was gone by the time the
+                # connect completed. BCM raises this immediately instead of
+                # retrying (deliberate contract as of 6842ef3), so this is
+                # not an error worth a traceback. The device was advertising
+                # seconds ago, so assume a blip once before conceding to the
+                # slow offline poll.
+                self._connected = False
+                self._notfound_streak += 1
+                next_delay = (
+                    self.reconnect_delay
+                    if self._notfound_streak == 1
+                    else self.OFFLINE_POLL_INTERVAL
+                )
+                logger.warning(
+                    "Power Watchdog %s vanished between scan and connect, "
+                    "retrying in %.0fs",
+                    self.address, next_delay,
+                )
 
             except Exception:
                 self._connected = False
@@ -697,18 +775,47 @@ class PowerWatchdogBLE:
             if not self._running:
                 break
 
-            logger.warning("Power Watchdog %s disconnected", self.address)
-            await self._interruptible_sleep(delay)
-            delay = min(delay * 1.5, self.reconnect_max_delay)
+            if next_delay is None:
+                logger.warning(
+                    "Power Watchdog %s disconnected", self.address,
+                )
+                next_delay = delay
+                delay = min(delay * 1.5, self.reconnect_max_delay)
 
-    def _on_watchdog_timeout(self):
-        """Called by ConnectionWatchdog when no notifications for 2 minutes."""
+            await self._interruptible_sleep(next_delay)
+
+    def _data_is_stale(self) -> bool:
+        """Return True if notifications have been absent for too long.
+
+        Checked inline by the session loop so that teardown never depends
+        on the ConnectionWatchdog task still being alive. The watchdog is
+        the fast path; this is the backstop for the watchdog itself dying
+        — cancelled, or its callback raising. A dead watchdog plus a loop
+        that trusted ``client.is_connected`` is what wedged this service
+        for four hours on 2026-08-09.
+        """
+        wd = self._watchdog
+        if wd is None:
+            return False
+        limit = NOTIFICATION_WATCHDOG_TIMEOUT * self.STALE_DATA_FACTOR
+        return (time.monotonic() - wd.last_activity) > limit
+
+    async def _on_watchdog_timeout(self):
+        """Called by ConnectionWatchdog when no notifications for 2 minutes.
+
+        Sets the flag the session loop actually reads and wakes it at once.
+        Declared async to match the documented callback contract; BCM now
+        tolerates a plain callable too, but relying on that would leave the
+        contract mismatch in place.
+        """
         logger.warning(
             "BLE watchdog: no notifications for %.0fs from %s, "
             "forcing reconnect",
             NOTIFICATION_WATCHDOG_TIMEOUT, self.address,
         )
         self._connected = False
+        self._reconnect_requested = True
+        self._cancel_sleep()
 
     async def _interruptible_sleep(self, seconds: float):
         """Sleep that can be cancelled by stop()."""
