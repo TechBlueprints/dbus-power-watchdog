@@ -46,12 +46,18 @@ dbus-power-watchdog.py          (single process — discovery + BLE + grid servi
   ├─ "Report AC Input Loads" system toggle (HasAcInLoads)
   ├─ "Use Inverter Metering" system toggle (RunWithoutGridMeter)
   └─ When a device is enabled:
-       ├─ Connects via bleak-connection-manager (BCM)
-       │    ├─ Cross-process scan locking (fcntl.flock)
-       │    ├─ Cache-first scanning (BlueZ D-Bus cache before StartDiscovery)
-       │    ├─ Pre-scan adapter health checks (detects stale BlueZ state)
-       │    ├─ Adapter rotation and score-based selection
-       │    └─ ConnectionWatchdog for dead connection detection
+       ├─ Resolves the device (BlueZ cache first, then a scan)
+       ├─ Connects via bleak-retry-connector, routed underneath by
+       │  bleak-connection-manager v2 (the "bleak catcher")
+       │    ├─ bleak.BleakClient rebound process wide at startup
+       │    ├─ Claim-aware adapter selection (/run/bt-claims, bt-claims
+       │    │  convention — other BLE services on the GX see our use)
+       │    ├─ Per-adapter link slots (ble_link_caps) and failure-driven
+       │    │  rotation for pinned devices
+       │    ├─ Post-connect validation: a link whose GATT is not a Power
+       │    │  Watchdog is torn down and retried on the next radio
+       │    └─ habluetooth connection-parameter tuning over the mgmt socket
+       ├─ NotificationWatchdog tears the session down on a silent link
        └─ Registers com.victronenergy.grid.power_watchdog_{mac_id}
 ```
 
@@ -93,7 +99,9 @@ The service scans BLE for two naming patterns:
 | Gen2 (WiFi+BT) | `WD_{type}_{serial}` | `WD_E7_aabbccddeeff` |
 | Gen1 (BT-only) | `PM{S\|D}...` (19 chars) | `PMD...` (50A), `PMS...` (30A) |
 
-Scanning handles BLE InProgress errors with retry and adapter rotation.
+Discovery scans use plain `BleakScanner` on the configured adapter.  Set
+`ble_wrap_scanner = true` to route scans through the connection manager's
+adapter-bound, claiming scanner instead.
 
 ## Requirements
 
@@ -111,7 +119,7 @@ installs or external package management required:
 | `velib_python` | Victron D-Bus service helper library |
 | `bleak` | Cross-platform BLE client library |
 | `bleak-retry-connector` | Connection retry logic with exponential backoff |
-| `bleak-connection-manager` | BLE connection lifecycle manager (scan locking, adapter rotation, health checks) |
+| `bleak-connection-manager` | v2 "bleak catcher": claim-aware adapter routing installed underneath every bleak client |
 | `bluetooth-adapters` | HCI adapter enumeration |
 | `aiooui` | OUI (MAC vendor) lookups |
 
@@ -284,11 +292,33 @@ scan_interval = 60
 bluetooth_adapters = hci0,hci1
 reconnect_delay = 10
 reconnect_max_delay = 120
+ble_connection_manager = true
+ble_link_caps = hci0:5
+ble_wrap_scanner = false
 ```
 
 The polling interval is configured per-device via the GUI slider (see above)
 and is not in the config file.  All other configuration is optional.  By
-default the service auto-detects adapters and uses sensible defaults.
+default the service considers every adapter the kernel exposes and uses
+sensible defaults.
+
+### BLE adapters and coordination
+
+`bluetooth_adapters` entries are passed to bleak-connection-manager verbatim
+and also decide which adapter our own scans run on:
+
+| Entry | Meaning |
+|-------|---------|
+| `hci1` | joins the shared pool of adapters links may be placed on |
+| `AA:BB:CC:DD:EE:FF@hci1` | pins that device to `hci1`; repeat the MAC for an ordered fallback list |
+
+`ble_connection_manager = false` disables the catcher and connects with plain
+bleak + bleak-retry-connector, uncoordinated with other BLE services.
+
+`ble_link_caps` (`hciX:N`) bounds established links per adapter — dongle
+limits are undocumented, so this is deployment config, not discovery (~5 is a
+workable start for CSR8510-based adapters, ~7 for Broadcom).  A full adapter
+is passed over instead of failing.  An adapter with no cap is never gated.
 
 ## Service Management
 

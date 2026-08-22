@@ -42,22 +42,24 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from bleak import BleakClient, BleakError
+from bleak import BleakClient, BleakError, BleakScanner
 from bleak.backends.device import BLEDevice
-from bleak_retry_connector import BleakNotFoundError
-
-from bleak_connection_manager import (
-    ConnectionWatchdog,
-    EscalationConfig,
-    EscalationPolicy,
-    LockConfig,
-    ScanLockConfig,
-    discover_adapters,
+from bleak_retry_connector import (
+    BleakNotFoundError,
+    BleakOutOfConnectionSlotsError,
     establish_connection,
-    managed_discover,
-    managed_find_device,
-    validate_gatt_services,
+    get_device,
+    get_device_by_adapter,
 )
+
+from power_watchdog_ble_manager import scan_adapter_for
+
+try:
+    # Stdlib-only in the library (it never imports bleak), but this module
+    # has to keep working with the connection manager absent or disabled.
+    from bleak_connection_manager import tolerate_late_gatt
+except Exception:  # pragma: no cover - the submodule is always present
+    tolerate_late_gatt = None
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,87 @@ CHARACTERISTIC_UUID = CHARACTERISTIC_UUID_GEN2
 # within this window.  Power Watchdog sends updates ~every 30s, so 2 minutes
 # of silence almost certainly means the radio link is dead.
 NOTIFICATION_WATCHDOG_TIMEOUT = 120.0  # seconds
+
+# How often the notification watchdog checks for silence.  Well under the
+# timeout so a dead link is caught promptly, cheap enough to ignore.
+WATCHDOG_CHECK_INTERVAL = 5.0  # seconds
+
+# How long to scan when the BlueZ cache has no record of the device.
+SCAN_TIMEOUT = 20.0  # seconds
+
+
+class NotificationWatchdog:
+    """Fire a callback when BLE notifications go quiet.
+
+    The connection manager routes and coordinates connections; noticing
+    that an established one has gone silent is the consumer's job, so this
+    lives here.  Deliberately narrow: it watches a timestamp and calls
+    back.  It does no BlueZ cleanup of its own — the session loop owns
+    teardown, and a watchdog that removed the device behind bleak's back is
+    what left ``client.is_connected`` stale under the v1 manager.
+
+    ``last_activity`` is public: the session loop reads it directly as its
+    own backstop, so a watchdog task that dies cannot wedge the session
+    (the 2026-08-09 four-hour wedge).
+    """
+
+    def __init__(self, timeout: float, on_timeout, name: str = ""):
+        self.timeout = timeout
+        self.last_activity = time.monotonic()
+        self._on_timeout = on_timeout
+        self._name = name
+        self._task: asyncio.Task | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def record_activity(self) -> None:
+        """Mark a notification as having just arrived."""
+        self.last_activity = time.monotonic()
+
+    def start(self) -> None:
+        if self._task is not None:
+            return
+        self.last_activity = time.monotonic()
+        self._loop = asyncio.get_event_loop()
+        self._task = asyncio.ensure_future(self._run())
+
+    def stop(self) -> None:
+        """Cancel the watcher.  Safe to call from any thread.
+
+        PowerWatchdogBLE.stop() runs on the main thread while this task
+        lives in the BLE thread's loop, and Task.cancel() is not thread
+        safe — a cross-thread stop has to go through the owning loop.
+        """
+        task, self._task = self._task, None
+        loop, self._loop = self._loop, None
+        if task is None or task.done():
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop or loop is None:
+            task.cancel()
+        elif not loop.is_closed():
+            loop.call_soon_threadsafe(task.cancel)
+
+    async def _run(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(WATCHDOG_CHECK_INTERVAL)
+                if (time.monotonic() - self.last_activity) <= self.timeout:
+                    continue
+                try:
+                    await self._on_timeout()
+                except Exception:
+                    # The session loop's staleness check still covers us —
+                    # losing the fast path is not worth losing the session.
+                    logger.exception(
+                        "Notification watchdog callback failed for %s",
+                        self._name,
+                    )
+                return
+        except asyncio.CancelledError:
+            pass
 
 
 def format_gatt_snapshot(client: BleakClient) -> str:
@@ -207,6 +290,33 @@ def resolve_power_watchdog_gatt(client: BleakClient) -> tuple[str, str, bool, st
     )
 
 
+async def validate_power_watchdog_gatt(client: BleakClient) -> bool:
+    """Post-connect validator: is this link actually a Power Watchdog?
+
+    A connect that returns success is not always a usable link — GATT can
+    come back empty, or resolved with only the Generic Attribute service.
+    Rejecting here is a connection failure to the connection manager, so
+    bleak-retry-connector attempts again on the next radio, instead of the
+    session tearing all the way down and waiting out the backoff.
+    """
+    try:
+        resolve_power_watchdog_gatt(client)
+        return True
+    except BleakError:
+        return False
+
+
+# The waits were implicit around every v1 validator; v2 makes them explicit
+# because the catcher itself never retries.  Keeping them preserves what
+# this service did before: give a device that registers its vendor services
+# late a chance before writing the link off.
+VALIDATE_CONNECTION = (
+    tolerate_late_gatt(validate_power_watchdog_gatt)
+    if tolerate_late_gatt is not None
+    else validate_power_watchdog_gatt
+)
+
+
 # ── Data model ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -311,28 +421,35 @@ def classify_device(name: str) -> DiscoveredDevice | None:
 
 async def scan_for_devices(
     timeout: float = 15.0,
-    scan_lock_config: ScanLockConfig | None = None,
+    ble_adapters: list[str] | None = None,
 ) -> list[DiscoveredDevice]:
     """Scan for Power Watchdog BLE devices.
 
-    Uses bleak-connection-manager's managed_discover for automatic
-    adapter rotation, scan locking, and InProgress retry.
+    Discovery uses plain ``BleakScanner``.  With ``ble_wrap_scanner`` on,
+    the connection manager has rebound it to its adapter-bound, claiming
+    scanner and this call is coordinated with other BLE services on the
+    device; with it off (the default) this is an ordinary scan, which is
+    why the adapter is chosen here rather than left to bleak.
 
     Args:
-        timeout: Scan timeout per attempt in seconds.
-        scan_lock_config: Cross-process scan lock config.  If None,
-            a default enabled config is used.
+        timeout: Scan timeout in seconds.
+        ble_adapters: Configured adapter entries.  Only the pool entries
+            matter for a discovery scan — it is not looking for one MAC.
 
     Returns:
         List of all unique DiscoveredDevice instances found.
     """
-    if scan_lock_config is None:
-        scan_lock_config = ScanLockConfig(enabled=True)
+    adapter = scan_adapter_for(None, ble_adapters or [])
+    kwargs = {"adapter": adapter} if adapter else {}
 
-    devices = await managed_discover(
-        timeout=timeout,
-        scan_lock_config=scan_lock_config,
-    )
+    try:
+        devices = await BleakScanner.discover(timeout=timeout, **kwargs)
+    except BleakError:
+        logger.exception(
+            "BLE discovery scan failed%s",
+            " on %s" % adapter if adapter else "",
+        )
+        return []
 
     found: list[DiscoveredDevice] = []
     seen_macs: set[str] = set()
@@ -365,10 +482,13 @@ async def scan_for_devices(
 class PowerWatchdogBLE:
     """BLE client that runs in a daemon thread and exposes data to the main thread.
 
-    Uses bleak-connection-manager for all BLE operations:
-    - managed_find_device for scanning (with scan lock + adapter rotation)
-    - establish_connection for connecting (with connect lock + all workarounds)
-    - ConnectionWatchdog for detecting dead connections
+    BLE operations, in order:
+    - resolve the device from the BlueZ cache, falling back to a scan
+    - establish_connection (bleak-retry-connector) drives the retries; the
+      client class it is handed is the connection manager's routed wrapper
+      whenever the catcher was installed, so adapter selection, link slots
+      and claim coordination happen underneath the connect
+    - NotificationWatchdog for detecting a silent link
 
     Protocol-specific notification handling and handshake logic is delegated
     to :class:`~power_watchdog_proto_gen2.Gen2Protocol` or
@@ -389,35 +509,37 @@ class PowerWatchdogBLE:
         address: str,
         reconnect_delay: float = 10.0,
         reconnect_max_delay: float = 120.0,
-        lock_config: LockConfig | None = None,
-        scan_lock_config: ScanLockConfig | None = None,
         ble_adapters: list[str] | None = None,
     ):
         self.address = address
         self.reconnect_delay = reconnect_delay
         self.reconnect_max_delay = reconnect_max_delay
-        # Pin scans + connections to these HCIs (e.g. ["hci1"]). None = BCM default.
+        # Configured adapter entries, verbatim ("hciX" pool, "MAC@hciX" pin).
+        # The connection manager routes connects with these; we use them to
+        # pick the adapter our own scan runs on. None/empty = bleak default.
         self._ble_adapters = ble_adapters
-
-        # BCM lock configs — default to enabled
-        self._lock_config = lock_config or LockConfig(enabled=True)
-        self._scan_lock_config = scan_lock_config or ScanLockConfig(enabled=True)
 
         self._data = WatchdogData()
         self._data_lock = threading.Lock()
         self._connected = False
         self._running = True
 
-        # Set by the notification watchdog to tear the session down. The
-        # session loop cannot key off client.is_connected: BCM's watchdog
-        # cleanup calls remove_device(), which leaves bleak's cached
-        # connection state stale forever (documented in ConnectionWatchdog).
+        # Set by the notification watchdog to tear the session down. Kept
+        # separate from client.is_connected on purpose: a link BlueZ still
+        # believes in can be silent, and that is exactly the case the
+        # watchdog exists to catch.
         self._reconnect_requested = False
 
-        # Consecutive "found by scan, gone by connect" failures. BCM raises
-        # BleakNotFoundError immediately rather than retrying, so the first
-        # one is treated as a blip and only a repeat concedes it is offline.
+        # Consecutive "resolved, gone by connect" failures. The device was
+        # advertising seconds ago, so the first one is treated as a blip and
+        # only a repeat concedes it is offline.
         self._notfound_streak = 0
+
+        # Skip the BlueZ cache on the next resolve. BlueZ remembers devices
+        # that have gone away, and connecting to a stale entry fails the
+        # same way every time — without this, a stale entry would keep us
+        # off the air forever, never scanning to find out otherwise.
+        self._force_scan = False
 
         # Advances once per session-loop iteration. Read by the daemon as a
         # liveness signal — see the connect_cycles property.
@@ -427,8 +549,8 @@ class PowerWatchdogBLE:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._sleep_task: asyncio.Task | None = None
 
-        # Connection watchdog (set when connected)
-        self._watchdog: ConnectionWatchdog | None = None
+        # Notification watchdog (set when connected)
+        self._watchdog: NotificationWatchdog | None = None
 
         # Start BLE daemon thread
         self._thread = threading.Thread(
@@ -538,10 +660,10 @@ class PowerWatchdogBLE:
     async def _async_main(self):
         """Connect, subscribe, and stay connected.
 
-        Uses bleak-connection-manager for all BLE operations:
-        1. managed_find_device — scan with lock + adapter rotation
-        2. establish_connection — connect with all workarounds
-        3. ConnectionWatchdog — detect dead radio links
+        1. resolve a BLEDevice — BlueZ cache first, then a scan
+        2. establish_connection — bleak-retry-connector drives the retries,
+           the connection manager routes each attempt underneath it
+        3. NotificationWatchdog — detect a link that has gone silent
 
         Protocol-specific notification handling and handshake logic is
         delegated to a protocol object selected after GATT resolution.
@@ -550,21 +672,12 @@ class PowerWatchdogBLE:
         from power_watchdog_proto_gen2 import Gen2Protocol
 
         delay = self.reconnect_delay
-        policy_adapters = (
-            self._ble_adapters
-            if self._ble_adapters
-            else discover_adapters()
-        )
         if self._ble_adapters:
             logger.info(
-                "BLE adapter pin active for %s: %s",
+                "BLE adapter config active for %s: %s",
                 self.address,
                 ", ".join(self._ble_adapters),
             )
-        escalation = EscalationPolicy(
-            policy_adapters,
-            config=EscalationConfig(reset_adapter=False),
-        )
 
         while self._running:
             client: BleakClient | None = None
@@ -576,18 +689,8 @@ class PowerWatchdogBLE:
             self._connect_cycles += 1
 
             try:
-                # Step 1: Find the device via managed scan
-                logger.info(
-                    "Scanning for Power Watchdog %s...", self.address,
-                )
-
-                device = await managed_find_device(
-                    self.address,
-                    timeout=20.0,
-                    max_attempts=3,
-                    adapters=self._ble_adapters,
-                    scan_lock_config=self._scan_lock_config,
-                )
+                # Step 1: Resolve a BLEDevice — BlueZ cache, then a scan
+                device = await self._resolve_device()
 
                 if device is None:
                     logger.warning(
@@ -598,23 +701,25 @@ class PowerWatchdogBLE:
                     await self._interruptible_sleep(self.OFFLINE_POLL_INTERVAL)
                     continue
 
-                # Step 2: Connect via BCM
+                # Step 2: Connect.  bleak-retry-connector owns the retry
+                # cadence and the error classification; BleakClient here is
+                # the connection manager's routed wrapper whenever the
+                # catcher is installed, so each attempt picks its adapter,
+                # takes its claims and tunes its connection parameters.
                 logger.info(
                     "Connecting to Power Watchdog %s...", self.address,
                 )
 
+                # validate_connection is a surplus kwarg, forwarded to the
+                # client class: the routed wrapper acts on it, and plain
+                # bleak ignores it (so with the manager off, a bad GATT
+                # table is still caught below, just without the retry).
                 client = await establish_connection(
                     BleakClient,
                     device,
                     "Power Watchdog %s" % self.address,
                     max_attempts=4,
-                    adapters=self._ble_adapters,
-                    close_inactive_connections=True,
-                    try_direct_first=True,
-                    validate_connection=validate_gatt_services,
-                    lock_config=self._lock_config,
-                    escalation_policy=escalation,
-                    overall_timeout=300.0,
+                    validate_connection=VALIDATE_CONNECTION,
                 )
 
                 # Step 3: Connected — resolve GATT and pick protocol
@@ -657,10 +762,23 @@ class PowerWatchdogBLE:
                     proto = Gen2Protocol()
                 proto.init_state(self, device_name=device_name)
 
-                # Subscribe to notifications
-                handler = lambda sender, data: proto.notification_handler(
-                    self, sender, data,
+                # Watchdog before subscribe, so a frame arriving during the
+                # handshake already counts as a sign of life.
+                self._watchdog = NotificationWatchdog(
+                    timeout=NOTIFICATION_WATCHDOG_TIMEOUT,
+                    on_timeout=self._on_watchdog_timeout,
+                    name=self.address,
                 )
+
+                # Subscribe to notifications.  Every frame stamps the
+                # watchdog, parseable or not: silence is the failure this
+                # watches for, and an unparseable frame is not silence.
+                def handler(sender, data, _proto=proto):
+                    watchdog = self._watchdog
+                    if watchdog is not None:
+                        watchdog.record_activity()
+                    _proto.notification_handler(self, sender, data)
+
                 logger.info("Subscribing to notifications on %s", notify_uuid)
                 try:
                     await asyncio.wait_for(
@@ -679,18 +797,12 @@ class PowerWatchdogBLE:
                 # Protocol-specific post-subscribe action (handshake or no-op)
                 await proto.after_subscribe(client, write_uuid, write_resp)
 
-                # Step 4: Start connection watchdog
-                self._watchdog = ConnectionWatchdog(
-                    timeout=NOTIFICATION_WATCHDOG_TIMEOUT,
-                    on_timeout=self._on_watchdog_timeout,
-                    client=client,
-                    device=device,
-                )
+                # Step 4: Arm the notification watchdog
                 self._watchdog.start()
 
                 # Step 5: Stay connected while data is actually flowing.
                 # client.is_connected alone is not a safe liveness signal —
-                # it stays True after BCM's remove_device() cleanup.
+                # a link BlueZ still believes in can carry nothing.
                 while (
                     client.is_connected
                     and self._running
@@ -729,22 +841,38 @@ class PowerWatchdogBLE:
                         self.address,
                     )
 
+            except BleakOutOfConnectionSlotsError:
+                # Every eligible adapter is at its configured link cap, or
+                # the controller itself refused another link. Not our
+                # device's fault and not something retrying harder fixes:
+                # wait for somebody else's link to end.
+                self._connected = False
+                next_delay = self.reconnect_delay
+                logger.warning(
+                    "No BLE connection slot free for %s, retrying in %.0fs",
+                    self.address, next_delay,
+                )
+
             except BleakNotFoundError:
-                # The scan found the device but it was gone by the time the
-                # connect completed. BCM raises this immediately instead of
-                # retrying (deliberate contract as of 6842ef3), so this is
-                # not an error worth a traceback. The device was advertising
+                # We resolved the device but it was gone by the time the
+                # connect completed — bleak-retry-connector exhausted its
+                # attempts against a device that stopped answering, so this
+                # is not an error worth a traceback. It was advertising
                 # seconds ago, so assume a blip once before conceding to the
                 # slow offline poll.
                 self._connected = False
                 self._notfound_streak += 1
+                # Whatever we connected to is not there. If it came from the
+                # cache, that entry is stale; scan next time rather than
+                # failing the same way forever.
+                self._force_scan = True
                 next_delay = (
                     self.reconnect_delay
                     if self._notfound_streak == 1
                     else self.OFFLINE_POLL_INTERVAL
                 )
                 logger.warning(
-                    "Power Watchdog %s vanished between scan and connect, "
+                    "Power Watchdog %s vanished between resolve and connect, "
                     "retrying in %.0fs",
                     self.address, next_delay,
                 )
@@ -784,11 +912,64 @@ class PowerWatchdogBLE:
 
             await self._interruptible_sleep(next_delay)
 
+    async def _resolve_device(self) -> BLEDevice | None:
+        """Resolve a BLEDevice for our address: BlueZ cache first, then scan.
+
+        The cache lookup costs no radio time and is usually enough — BlueZ
+        remembers what it has seen — and it yields a device carrying its
+        D-Bus path, which is what decides the adapter the link is made on.
+        A scan is the fallback for a device BlueZ has forgotten, or for the
+        first connect after a bluetoothd restart.
+        """
+        adapter = scan_adapter_for(self.address, self._ble_adapters or [])
+
+        if self._force_scan:
+            self._force_scan = False
+            device = None
+        else:
+            device = await self._device_from_cache(adapter)
+
+        if device is not None:
+            logger.info(
+                "Resolved Power Watchdog %s from the BlueZ cache%s",
+                self.address,
+                " on %s" % adapter if adapter else "",
+            )
+            return device
+
+        logger.info(
+            "Scanning for Power Watchdog %s%s...",
+            self.address,
+            " on %s" % adapter if adapter else "",
+        )
+        kwargs = {"adapter": adapter} if adapter else {}
+        return await BleakScanner.find_device_by_address(
+            self.address, timeout=SCAN_TIMEOUT, **kwargs
+        )
+
+    async def _device_from_cache(self, adapter: str | None) -> BLEDevice | None:
+        """Look our address up in BlueZ's device cache, or None."""
+        try:
+            return (
+                await get_device_by_adapter(self.address, adapter)
+                if adapter
+                else await get_device(self.address)
+            )
+        except Exception:
+            # A cache miss is normal; a cache *failure* (no D-Bus, no
+            # bluetoothd) is worth saying once, then falling through to the
+            # scan, which fails with a better message if it is really down.
+            logger.exception(
+                "BlueZ lookup failed for %s, falling back to a scan",
+                self.address,
+            )
+            return None
+
     def _data_is_stale(self) -> bool:
         """Return True if notifications have been absent for too long.
 
         Checked inline by the session loop so that teardown never depends
-        on the ConnectionWatchdog task still being alive. The watchdog is
+        on the NotificationWatchdog task still being alive. The watchdog is
         the fast path; this is the backstop for the watchdog itself dying
         — cancelled, or its callback raising. A dead watchdog plus a loop
         that trusted ``client.is_connected`` is what wedged this service
@@ -801,12 +982,12 @@ class PowerWatchdogBLE:
         return (time.monotonic() - wd.last_activity) > limit
 
     async def _on_watchdog_timeout(self):
-        """Called by ConnectionWatchdog when no notifications for 2 minutes.
+        """Called by NotificationWatchdog after 2 minutes of silence.
 
         Sets the flag the session loop actually reads and wakes it at once.
-        Declared async to match the documented callback contract; BCM now
-        tolerates a plain callable too, but relying on that would leave the
-        contract mismatch in place.
+        Declared async because the watchdog awaits it — a plain def would
+        return None and `await None` is a TypeError, which is precisely how
+        the watchdog died on 2026-08-09.
         """
         logger.warning(
             "BLE watchdog: no notifications for %.0fs from %s, "

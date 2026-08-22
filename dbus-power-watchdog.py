@@ -66,15 +66,6 @@ for _sub in [
 from vedbus import VeDbusService  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402
 
-from bleak_connection_manager import LockConfig, ScanLockConfig  # noqa: E402
-from power_watchdog_ble import (  # noqa: E402
-    PowerWatchdogBLE,
-    scan_for_devices,
-    classify_device,
-    DiscoveredDevice,
-)
-from grid_publisher import ERROR_MESSAGES, GRID_ALARM_PATHS, GridPublisher  # noqa: E402
-
 VERSION = "0.8.0"
 
 logging.basicConfig(
@@ -83,6 +74,30 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("dbus-power-watchdog")
+
+# The connection manager rebinds bleak.BleakClient process wide, and a
+# module only picks the wrapper up through its own `from bleak import
+# BleakClient` if the install already happened when it was imported.
+# power_watchdog_ble imports bleak at module scope, hence the install here,
+# above that import and below logging setup so its own logging is visible.
+#
+# Guarded on __main__ deliberately: importing this file (the test suite
+# does) must not rebind bleak or take claim files in somebody else's
+# process.  Running it as the service is the only case that wants that.
+from power_watchdog_ble_manager import (  # noqa: E402
+    install_ble_connection_manager,
+)
+
+if __name__ == "__main__":
+    install_ble_connection_manager()
+
+from power_watchdog_ble import (  # noqa: E402
+    PowerWatchdogBLE,
+    scan_for_devices,
+    classify_device,
+    DiscoveredDevice,
+)
+from grid_publisher import ERROR_MESSAGES, GRID_ALARM_PATHS, GridPublisher  # noqa: E402
 
 # Default scan interval when discovery is enabled (seconds)
 DEFAULT_SCAN_INTERVAL = 60
@@ -191,13 +206,9 @@ class PowerWatchdogService:
             self._ble_adapters = None
         if self._ble_adapters:
             logger.info(
-                "BLE adapter pin from config: %s",
+                "BLE adapters from config: %s",
                 ", ".join(self._ble_adapters),
             )
-
-        # BCM lock configs for cross-process BLE coordination
-        self._lock_config = LockConfig(enabled=True)
-        self._scan_lock_config = ScanLockConfig(enabled=True)
 
         logger.info("Scan interval: %ds", self._scan_interval)
 
@@ -482,7 +493,7 @@ class PowerWatchdogService:
             found = loop.run_until_complete(
                 scan_for_devices(
                     timeout=15.0,
-                    scan_lock_config=self._scan_lock_config,
+                    ble_adapters=self._ble_adapters,
                 )
             )
             loop.close()
@@ -699,13 +710,13 @@ class PowerWatchdogService:
 
         logger.info("Activating device %s (%s), poll=%dms", mac_id, mac_address, poll_ms)
 
-        # Start BLE client with BCM lock configs for cross-process coordination
+        # Start the BLE client.  Connections route through the connection
+        # manager when it is installed; the adapter entries also steer our
+        # own scans (see power_watchdog_ble_manager.scan_adapter_for).
         self._ble = PowerWatchdogBLE(
             address=mac_address,
             reconnect_delay=self._reconnect_delay,
             reconnect_max_delay=self._reconnect_max_delay,
-            lock_config=self._lock_config,
-            scan_lock_config=self._scan_lock_config,
             ble_adapters=self._ble_adapters,
         )
 

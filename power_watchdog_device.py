@@ -57,10 +57,6 @@ for _sub in [
 from vedbus import VeDbusService  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402
 
-from bleak_connection_manager import LockConfig, ScanLockConfig  # noqa: E402
-from power_watchdog_ble import PowerWatchdogBLE, WatchdogData  # noqa: E402
-from grid_publisher import ERROR_MESSAGES, GridPublisher  # noqa: E402
-
 VERSION = "0.6.0"
 
 logging.basicConfig(
@@ -69,6 +65,22 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("power-watchdog-device")
+
+# Before power_watchdog_ble, which captures `from bleak import BleakClient`
+# at import time — see power_watchdog_ble_manager.  Guarded on __main__ so
+# importing this module never rebinds bleak in another process.  --adapter
+# is not available this early (argparse runs in main), and does not need to
+# be: it is applied by resolving the device on that adapter, and the
+# catcher treats a device that names its own D-Bus path as explicit.
+from power_watchdog_ble_manager import (  # noqa: E402
+    install_ble_connection_manager,
+)
+
+if __name__ == "__main__":
+    install_ble_connection_manager(owner="dbus-power-watchdog-device")
+
+from power_watchdog_ble import PowerWatchdogBLE  # noqa: E402
+from grid_publisher import ERROR_MESSAGES, GridPublisher  # noqa: E402
 
 # Valid roles and their D-Bus service class
 ALLOWED_ROLES = ["grid", "pvinverter", "genset"]
@@ -132,7 +144,9 @@ class PowerWatchdogDeviceService:
                 ", ".join(ble_adapters),
             )
         else:
-            logger.info("BLE adapter: auto (BCM uses discovered HCIs)")
+            logger.info(
+                "BLE adapter: auto (the connection manager places the link)",
+            )
         logger.info("Update interval: %dms", self._update_interval_ms)
 
         # Start BLE client in daemon thread
@@ -140,8 +154,6 @@ class PowerWatchdogDeviceService:
             address=self._mac_address,
             reconnect_delay=reconnect_delay,
             reconnect_max_delay=reconnect_max_delay,
-            lock_config=LockConfig(enabled=True),
-            scan_lock_config=ScanLockConfig(enabled=True),
             ble_adapters=ble_adapters,
         )
 

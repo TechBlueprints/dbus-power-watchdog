@@ -351,10 +351,10 @@ class TestClassifyDevice:
 
 # ── Session liveness (the 2026-08-09 wedge) ───────────────────────────────
 #
-# The service sat wedged for four hours because the ConnectionWatchdog died
-# (its sync callback was awaited and raised TypeError) while the session loop
-# spun on a stale ``client.is_connected``.  These cover the two independent
-# guards added so neither failure alone can wedge it again.
+# The service sat wedged for four hours because the notification watchdog
+# died (its sync callback was awaited and raised TypeError) while the session
+# loop spun on a stale ``client.is_connected``.  These cover the two
+# independent guards added so neither failure alone can wedge it again.
 
 
 import asyncio
@@ -409,8 +409,8 @@ class TestDataIsStale:
 
 class TestWatchdogTimeoutCallback:
     def test_callback_is_a_coroutine_function(self):
-        # BCM awaits the return value. A plain def returns None, and
-        # `await None` is the TypeError that killed the watchdog.
+        # NotificationWatchdog awaits the return value. A plain def returns
+        # None, and `await None` is the TypeError that killed the watchdog.
         assert asyncio.iscoroutinefunction(
             PowerWatchdogBLE._on_watchdog_timeout
         )
@@ -427,3 +427,356 @@ class TestWatchdogTimeoutCallback:
         ble._sleep_task = None
         asyncio.run(ble._on_watchdog_timeout())
         assert ble._reconnect_requested is True
+
+
+# ── Notification watchdog ─────────────────────────────────────────────────
+#
+# The v1 connection manager supplied this; v2 routes connections and leaves
+# noticing a silent link to the consumer, so it lives here now.
+
+from unittest.mock import patch
+
+from power_watchdog_ble import (  # noqa: E402
+    NotificationWatchdog,
+    SCAN_TIMEOUT,
+    scan_for_devices,
+)
+
+
+def pw_ble_scanner():
+    """The BleakScanner class as power_watchdog_ble sees it."""
+    import power_watchdog_ble
+
+    return power_watchdog_ble.BleakScanner
+
+
+
+class TestNotificationWatchdog:
+    def test_record_activity_moves_the_stamp_forward(self):
+        wd = NotificationWatchdog(timeout=60.0, on_timeout=None)
+        wd.last_activity = _time.monotonic() - 30
+        before = wd.last_activity
+        wd.record_activity()
+        assert wd.last_activity > before
+
+    def test_fires_after_silence(self):
+        fired = []
+
+        async def on_timeout():
+            fired.append(True)
+
+        async def scenario():
+            wd = NotificationWatchdog(timeout=0.0, on_timeout=on_timeout)
+            with patch("power_watchdog_ble.WATCHDOG_CHECK_INTERVAL", 0.01):
+                wd.start()
+                await asyncio.sleep(0.1)
+            wd.stop()
+
+        asyncio.run(scenario())
+        assert fired == [True]
+
+    def test_does_not_fire_while_notifications_arrive(self):
+        fired = []
+
+        async def on_timeout():
+            fired.append(True)
+
+        async def scenario():
+            wd = NotificationWatchdog(timeout=1.0, on_timeout=on_timeout)
+            with patch("power_watchdog_ble.WATCHDOG_CHECK_INTERVAL", 0.01):
+                wd.start()
+                for _ in range(10):
+                    await asyncio.sleep(0.01)
+                    wd.record_activity()
+            wd.stop()
+
+        asyncio.run(scenario())
+        assert fired == []
+
+    def test_callback_failure_does_not_escape(self):
+        # The session loop's own staleness check still covers us; a raising
+        # callback must not take the event loop down with it.
+        async def on_timeout():
+            raise RuntimeError("boom")
+
+        async def scenario():
+            wd = NotificationWatchdog(timeout=0.0, on_timeout=on_timeout)
+            with patch("power_watchdog_ble.WATCHDOG_CHECK_INTERVAL", 0.01):
+                wd.start()
+                await asyncio.sleep(0.1)
+                task = wd._task
+            wd.stop()
+            return task
+
+        task = asyncio.run(scenario())
+        assert task.done()
+        assert task.exception() is None
+
+    def test_stop_from_another_thread(self):
+        # PowerWatchdogBLE.stop() runs on the main thread while the task
+        # lives in the BLE thread's loop; a direct Task.cancel() across
+        # threads is not safe.
+        import threading
+
+        wd = NotificationWatchdog(timeout=60.0, on_timeout=None)
+        ready = threading.Event()
+        stopped = threading.Event()
+        state = {}
+
+        async def loop_body():
+            wd.start()
+            ready.set()
+            stopped.wait(5.0)
+            await asyncio.sleep(0.05)
+            state["cancelled"] = wd_task.cancelled() or wd_task.done()
+
+        def run_loop():
+            asyncio.run(loop_body())
+
+        thread = threading.Thread(target=run_loop, daemon=True)
+        thread.start()
+        ready.wait(5.0)
+        wd_task = wd._task
+        wd.stop()
+        stopped.set()
+        thread.join(5.0)
+
+        assert state["cancelled"] is True
+
+    def test_stop_before_start_is_harmless(self):
+        NotificationWatchdog(timeout=1.0, on_timeout=None).stop()
+
+    def test_start_is_idempotent(self):
+        async def scenario():
+            wd = NotificationWatchdog(timeout=60.0, on_timeout=None)
+            wd.start()
+            first = wd._task
+            wd.start()
+            assert wd._task is first
+            wd.stop()
+
+        asyncio.run(scenario())
+
+
+# ── Device resolution ─────────────────────────────────────────────────────
+
+
+def _ble_for_resolve(adapters=None, force_scan=False) -> PowerWatchdogBLE:
+    ble = object.__new__(PowerWatchdogBLE)
+    ble.address = "AA:BB:CC:DD:EE:FF"
+    ble._ble_adapters = adapters
+    ble._force_scan = force_scan
+    return ble
+
+
+class _FakeDevice:
+    def __init__(self, address="AA:BB:CC:DD:EE:FF", name="WD_E7_abc123"):
+        self.address = address
+        self.name = name
+
+
+class TestResolveDevice:
+    def test_cache_hit_skips_the_scan(self):
+        device = _FakeDevice()
+
+        async def fake_get_device(address):
+            return device
+
+        with patch("power_watchdog_ble.get_device", fake_get_device), \
+             patch("power_watchdog_ble.BleakScanner") as scanner:
+            found = asyncio.run(_ble_for_resolve()._resolve_device())
+
+        assert found is device
+        scanner.find_device_by_address.assert_not_called()
+
+    def test_configured_adapter_is_used_for_the_cache_lookup(self):
+        seen = {}
+
+        async def fake_by_adapter(address, adapter):
+            seen["address"] = address
+            seen["adapter"] = adapter
+            return _FakeDevice()
+
+        with patch(
+            "power_watchdog_ble.get_device_by_adapter", fake_by_adapter,
+        ):
+            asyncio.run(_ble_for_resolve(["hci1"])._resolve_device())
+
+        assert seen == {"address": "AA:BB:CC:DD:EE:FF", "adapter": "hci1"}
+
+    def test_cache_miss_falls_back_to_a_scan(self):
+        device = _FakeDevice()
+        seen = {}
+
+        async def fake_get_device(address):
+            return None
+
+        async def fake_find(address, timeout=None, **kwargs):
+            seen["timeout"] = timeout
+            seen["kwargs"] = kwargs
+            return device
+
+        with patch("power_watchdog_ble.get_device", fake_get_device), \
+             patch.object(
+                 pw_ble_scanner(), "find_device_by_address", fake_find,
+             ):
+            found = asyncio.run(_ble_for_resolve()._resolve_device())
+
+        assert found is device
+        assert seen["timeout"] == SCAN_TIMEOUT
+        assert seen["kwargs"] == {}
+
+    def test_scan_uses_the_configured_adapter(self):
+        seen = {}
+
+        async def fake_by_adapter(address, adapter):
+            return None
+
+        async def fake_find(address, timeout=None, **kwargs):
+            seen["kwargs"] = kwargs
+            return None
+
+        with patch(
+            "power_watchdog_ble.get_device_by_adapter", fake_by_adapter,
+        ), patch.object(pw_ble_scanner(), "find_device_by_address", fake_find):
+            asyncio.run(_ble_for_resolve(["hci1"])._resolve_device())
+
+        assert seen["kwargs"] == {"adapter": "hci1"}
+
+    def test_force_scan_skips_the_cache_once(self):
+        # A stale BlueZ entry fails the connect the same way every time, so
+        # the cycle after a not-found must go back to the radio.
+        device = _FakeDevice()
+        cache_calls = []
+
+        async def fake_get_device(address):
+            cache_calls.append(address)
+            return _FakeDevice()
+
+        async def fake_find(address, timeout=None, **kwargs):
+            return device
+
+        ble = _ble_for_resolve(force_scan=True)
+        with patch("power_watchdog_ble.get_device", fake_get_device), \
+             patch.object(
+                 pw_ble_scanner(), "find_device_by_address", fake_find,
+             ):
+            assert asyncio.run(ble._resolve_device()) is device
+            assert cache_calls == []
+            # One cycle only: the next resolve is back to cache-first.
+            assert ble._force_scan is False
+            assert asyncio.run(ble._resolve_device()) is not device
+            assert cache_calls == ["AA:BB:CC:DD:EE:FF"]
+
+    def test_bluez_failure_falls_through_to_the_scan(self):
+        # No D-Bus, no bluetoothd: say so once, then let the scan produce
+        # the real error rather than giving up here.
+        device = _FakeDevice()
+
+        async def boom(address):
+            raise RuntimeError("no bus")
+
+        async def fake_find(address, timeout=None, **kwargs):
+            return device
+
+        with patch("power_watchdog_ble.get_device", boom), \
+             patch.object(
+                 pw_ble_scanner(), "find_device_by_address", fake_find,
+             ):
+            assert asyncio.run(
+                _ble_for_resolve()._resolve_device()
+            ) is device
+
+# ── Discovery scan ────────────────────────────────────────────────────────
+
+
+class TestScanForDevices:
+    def test_classifies_and_dedupes(self):
+        devices = [
+            _FakeDevice("AA:BB:CC:DD:EE:01", "WD_E7_abc123"),
+            _FakeDevice("AA:BB:CC:DD:EE:01", "WD_E7_abc123"),
+            _FakeDevice("AA:BB:CC:DD:EE:02", "iPhone"),
+        ]
+
+        async def fake_discover(timeout=None, **kwargs):
+            return devices
+
+        with patch.object(pw_ble_scanner(), "discover", fake_discover):
+            found = asyncio.run(scan_for_devices(timeout=1.0))
+
+        assert [d.mac for d in found] == ["AA:BB:CC:DD:EE:01"]
+
+    def test_pool_adapter_is_passed_to_the_scan(self):
+        seen = {}
+
+        async def fake_discover(timeout=None, **kwargs):
+            seen["kwargs"] = kwargs
+            return []
+
+        with patch.object(pw_ble_scanner(), "discover", fake_discover):
+            asyncio.run(scan_for_devices(ble_adapters=["hci1"]))
+
+        assert seen["kwargs"] == {"adapter": "hci1"}
+
+    def test_scan_failure_returns_empty(self):
+        # Discovery runs on a timer; one failed sweep must not take the
+        # service down or stop later sweeps.
+        async def boom(timeout=None, **kwargs):
+            raise BleakError("adapter gone")
+
+        with patch.object(pw_ble_scanner(), "discover", boom):
+            assert asyncio.run(scan_for_devices()) == []
+
+
+# ── Post-connect validation ───────────────────────────────────────────────
+#
+# v1's establish_connection took validate_connection; v2 moved the hook onto
+# the routed client, so the same guard is back with the same contract: a
+# rejection is a connection failure, retried on the next radio.
+
+from power_watchdog_ble import (  # noqa: E402
+    VALIDATE_CONNECTION,
+    validate_power_watchdog_gatt,
+)
+
+
+class TestValidatePowerWatchdogGatt:
+    def test_accepts_gen2(self):
+        client = _MockClient(
+            [_MockSvc([_MockChar(CHARACTERISTIC_UUID_GEN2, ["notify", "write"])])],
+        )
+        assert asyncio.run(validate_power_watchdog_gatt(client)) is True
+
+    def test_accepts_gen1(self):
+        client = _MockClient(
+            [
+                _MockSvc(
+                    [
+                        _MockChar(CHARACTERISTIC_UUID_GEN1_TX, ["notify"]),
+                        _MockChar(
+                            CHARACTERISTIC_UUID_GEN1_RX,
+                            ["write-without-response"],
+                        ),
+                    ],
+                ),
+            ],
+        )
+        assert asyncio.run(validate_power_watchdog_gatt(client)) is True
+
+    def test_rejects_empty_gatt(self):
+        # The case the validator exists for: connect succeeded, GATT is
+        # empty or only carries Generic Attribute.
+        assert asyncio.run(validate_power_watchdog_gatt(_MockClient([]))) is False
+
+    def test_rejects_unknown_layout(self):
+        client = _MockClient(
+            [_MockSvc([_MockChar("0000180a-0000-1000-8000-00805f9b34fb", ["read"])])],
+        )
+        assert asyncio.run(validate_power_watchdog_gatt(client)) is False
+
+    def test_exported_validator_tolerates_late_gatt(self):
+        # v1 waited out chips that register vendor services seconds after
+        # ServicesResolved; v2 makes that wrapper explicit, so it must
+        # actually be applied and not silently dropped.
+        assert VALIDATE_CONNECTION is not validate_power_watchdog_gatt
+        assert asyncio.iscoroutinefunction(VALIDATE_CONNECTION)

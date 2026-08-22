@@ -14,7 +14,8 @@ from unittest.mock import MagicMock
 
 # ── BLE (bleak + bleak-connection-manager) ────────────────────────────────
 # Real packages from ext/ are used (see pytest.ini pythonpath).  Do not stub
-# ``bleak`` here — a stub shadows the package and breaks BCM imports.
+# ``bleak`` here — a stub shadows the package, and the connection manager
+# imports the real one to rebind it.
 
 # ── Mock dbus and gi ────────────────────────────────────────────────────────
 
