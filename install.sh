@@ -91,60 +91,36 @@ else
 fi
 echo ""
 
-# Step 3: Initialize all submodules (BLE stack + velib_python)
-echo "Step 3: Setting up dependencies..."
+# Step 3: Initialize velib_python (the only thing this repo still vendors)
+echo "Step 3: Setting up velib_python..."
 cd "$INSTALL_DIR"
 
-# Required submodules and their fallback clone URLs
-SUBMODULES="
-velib_python|https://github.com/victronenergy/velib_python.git
-bleak-retry-connector|https://github.com/Bluetooth-Devices/bleak-retry-connector.git
-bleak|https://github.com/hbldh/bleak.git
-bluetooth-adapters|https://github.com/Bluetooth-Devices/bluetooth-adapters.git
-aiooui|https://github.com/Bluetooth-Devices/aiooui.git
-"
-
-git submodule update --init --recursive 2>/dev/null && {
-    echo "All submodules initialized"
-} || {
-    echo "Submodule init failed, cloning dependencies individually..."
+git submodule update --init ext/velib_python 2>/dev/null || {
+    echo "Submodule init failed, cloning velib_python directly..."
     mkdir -p ext
-    echo "$SUBMODULES" | while IFS='|' read -r name url; do
-        [ -z "$name" ] && continue
-        if [ ! -d "ext/$name/.git" ] && [ ! -f "ext/$name/.git" ]; then
-            echo "  Cloning $name..."
-            rm -rf "ext/$name" 2>/dev/null
-            git clone "$url" "ext/$name" 2>/dev/null || echo "  WARNING: Failed to clone $name"
-        fi
-    done
+    if [ ! -e "ext/velib_python/.git" ]; then
+        rm -rf ext/velib_python 2>/dev/null
+        git clone https://github.com/victronenergy/velib_python.git ext/velib_python \
+            2>/dev/null || echo "  WARNING: Failed to clone velib_python"
+    fi
 }
 
-# Verify critical dependencies
-MISSING=""
-for dep in velib_python/vedbus.py bleak/bleak/__init__.py bleak-retry-connector/src/bleak_retry_connector/__init__.py; do
-    if [ ! -f "ext/$dep" ]; then
-        MISSING="$MISSING  ext/$dep\n"
-    fi
-done
-if [ -n "$MISSING" ]; then
-    echo ""
-    echo "WARNING: Some dependencies are missing:"
-    printf "$MISSING"
-    echo "The service may not start correctly."
-    echo "Try: cd $INSTALL_DIR && git submodule update --init --recursive"
+if [ -f "ext/velib_python/vedbus.py" ]; then
+    echo "velib_python verified"
 else
-    echo "All dependencies verified"
+    echo "WARNING: ext/velib_python/vedbus.py missing; the service will not start."
 fi
 echo ""
 
 # Step 3b: Converge the shared bleak-connection-manager install.
 #
-# The connection manager is NOT vendored by this repo -- this is where it
-# comes from. One checkout under /data/bcm serves the BLE stack (bleak,
-# bleak-retry-connector, bleak-connection-manager) to every BLE service on
-# the box, and service/run execs through its interpreter shim, so nothing
-# here can pin the fleet to a private version. The ext/ trees above remain
-# only so a bare clone still has a bleak to import.
+# This repo vendors NO part of the BLE stack -- this is where all of it
+# comes from. One checkout under /data/bcm serves bleak, bleak-retry-connector
+# and bleak-connection-manager to every BLE service on the box, and
+# service/run execs through its interpreter shim, so nothing here can pin the
+# fleet to a private version (and the tests cannot drift onto a different
+# bleak than production runs). Without it the service has no bleak at all,
+# so a failure here is fatal rather than a degradation.
 #
 # Idempotent, and safe when another consumer already installed it: --ff-only
 # means a stale installer can never move the fleet backwards.  --autowire is
@@ -183,8 +159,12 @@ if [ "$BCM_OK" = true ]; then
         NEEDS_RESTART=true
     fi
 else
-    echo "WARNING: could not converge the shared BLE stack at $BCM_DIR."
-    echo "The service will fall back to the vendored ext/ copies."
+    echo ""
+    echo "ERROR: could not converge the shared BLE stack at $BCM_DIR."
+    echo "Nothing else provides bleak: this repo vendors none of it, so the"
+    echo "service cannot start until this succeeds. Check connectivity and"
+    echo "re-run; the install is idempotent and resumes from partial state."
+    exit 1
 fi
 echo ""
 

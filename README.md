@@ -111,31 +111,39 @@ adapter-bound, claiming scanner instead.
 - Python 3 (included with Venus OS)
 - Git (for cloning; the installer will install it via `opkg` if needed)
 
-In production the BLE stack comes from the **shared install at `/data/bcm`**:
-one bleak-connection-manager checkout serves every BLE service on the GX, and
-`service/run` execs through its interpreter shim (`/data/bcm/python3`), which
-puts bleak, bleak-retry-connector and bleak-connection-manager on `PYTHONPATH`.
+The **entire BLE stack comes from the shared install at `/data/bcm`** — one
+bleak-connection-manager checkout serving every BLE service on the GX.
 `install.sh` converges that checkout (clone, or fetch + `--ff-only`) and runs
-its installer.  This is what keeps every BLE service on the box speaking one
-version of the claims convention.
+its installer; `service/run` then execs through its interpreter shim
+(`/data/bcm/python3`), which puts bleak, bleak-retry-connector and
+bleak-connection-manager on `PYTHONPATH`.  This is what keeps every BLE
+service on the box speaking one version of the claims convention.
 
-bleak-connection-manager is **not vendored or pinned by this repo** — a
-private pin is how a service drifts onto a different version of the claims
-convention than the rest of the fleet. The submodules in `ext/` remain only
-as the **standalone fallback** so a bare clone still has a `bleak` to import;
-`power_watchdog_ble_manager._ensure_ble_stack()` adds them to `sys.path` only
-when the interpreter does not already provide the stack. Without a shared
-install the catcher import simply fails and the service connects
-uncoordinated. No pip installs or external package management required
-either way:
+**This repo vendors no part of that stack, and pins no version of it.**  A
+private pin is how one service drifts onto a different convention than the
+rest of the fleet — and it also let this repo's tests run bleak 2.1.1 while
+production ran 3.0.2.  The shared install failing is therefore fatal, not a
+degradation: nothing else provides bleak.
 
 | Submodule | Purpose |
 |-----------|---------|
-| `velib_python` | Victron D-Bus service helper library |
-| `bleak` | Cross-platform BLE client library |
-| `bleak-retry-connector` | Connection retry logic with exponential backoff |
-| `bluetooth-adapters` | HCI adapter enumeration |
-| `aiooui` | OUI (MAC vendor) lookups |
+| `velib_python` | Victron D-Bus service helper library (not served by the shared install) |
+
+### Running the tests
+
+The suite needs a bleak of its own, pinned to what the shared checkout
+serves so it cannot drift from production:
+
+```bash
+python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-dev.txt
+```
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+bleak-connection-manager is deliberately absent there — the tests stub it,
+and its absence exercises the documented "connect uncoordinated" path.
 
 ## Installation
 
