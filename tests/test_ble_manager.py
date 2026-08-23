@@ -241,3 +241,81 @@ class TestImportSideEffects:
 
         assert bleak.BleakClient.__module__.startswith("bleak")
         assert "bleak_connection_manager" not in bleak.BleakClient.__module__
+
+
+# ── Shared-stack resolution ───────────────────────────────────────────────
+#
+# Production runs on /data/bcm via the interpreter shim (service/run), which
+# puts the BLE stack on PYTHONPATH. These cover the standalone fallback: it
+# must fill in for a bare clone, and must never shadow a stack the
+# interpreter already provides.
+
+import importlib.util  # noqa: E402
+import os  # noqa: E402
+
+from power_watchdog_ble_manager import _ensure_ble_stack  # noqa: E402
+
+
+def _ext_paths_in(path_list):
+    return [p for p in path_list if os.sep + "ext" + os.sep in p]
+
+
+class TestEnsureBleStack:
+    def test_noop_when_already_imported(self, monkeypatch):
+        # The cheap check first: the package is in sys.modules, so nothing
+        # is resolved and nothing is inserted.
+        monkeypatch.setitem(
+            sys.modules, "bleak_connection_manager", types.ModuleType("x"),
+        )
+        before = list(sys.path)
+        monkeypatch.setattr(sys, "path", list(sys.path))
+        _ensure_ble_stack()
+        assert sys.path == before
+
+    def test_noop_when_the_interpreter_provides_it(self, monkeypatch):
+        # What happens under the shim: not yet imported, but importable, so
+        # the vendored copies must not shadow /data/bcm's.
+        monkeypatch.delitem(sys.modules, "bleak_connection_manager", raising=False)
+        monkeypatch.setattr(
+            importlib.util, "find_spec", lambda name: object(),
+        )
+        monkeypatch.setattr(sys, "path", ["/only-this"])
+        _ensure_ble_stack()
+        assert sys.path == ["/only-this"]
+
+    def test_inserts_vendored_paths_when_absent(self, monkeypatch):
+        # A bare clone: nothing provides the stack, so ext/ fills in.
+        monkeypatch.delitem(sys.modules, "bleak_connection_manager", raising=False)
+        monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+        monkeypatch.setattr(sys, "path", ["/only-this"])
+        _ensure_ble_stack()
+        inserted = _ext_paths_in(sys.path)
+        assert inserted, "expected the vendored ext/ paths to be inserted"
+        assert any(p.endswith(os.path.join("bleak-connection-manager", "src"))
+                   for p in inserted)
+
+    def test_find_spec_valueerror_degrades_to_inserting(self, monkeypatch):
+        # A stubbed module with __spec__ = None makes find_spec raise
+        # ValueError. The safe direction is to insert, never to run with no
+        # stack at all.
+        def boom(name):
+            raise ValueError("__spec__ is None")
+
+        monkeypatch.delitem(sys.modules, "bleak_connection_manager", raising=False)
+        monkeypatch.setattr(importlib.util, "find_spec", boom)
+        monkeypatch.setattr(sys, "path", ["/only-this"])
+        _ensure_ble_stack()
+        assert _ext_paths_in(sys.path)
+
+    def test_install_resolves_the_stack_even_when_disabled(self, monkeypatch):
+        # power_watchdog_ble imports bleak whether or not the catcher is on,
+        # so resolution must happen before the enabled check.
+        calls = []
+        monkeypatch.setattr(
+            "power_watchdog_ble_manager._ensure_ble_stack",
+            lambda: calls.append(True),
+        )
+        install_ble_connection_manager(
+            settings={"ble_connection_manager": "false"},
+        )
+        assert calls == [True]

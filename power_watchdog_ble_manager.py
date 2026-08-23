@@ -32,6 +32,7 @@ from __future__ import annotations
 import configparser
 import logging
 import os
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,47 @@ DEFAULT_LINK_CAPS = ""
 # Claim owner recorded in /run/bt-claims for the main service.  The library
 # appends this process's pid, so restarts never collide.
 CLAIM_OWNER = "dbus-power-watchdog"
+
+
+def _ensure_ble_stack() -> None:
+    """Put the vendored ext/ BLE stack on sys.path unless already provided.
+
+    In production the shared checkout provides it: the run script execs
+    through ``/data/bcm/python3``, whose PYTHONPATH already carries bleak,
+    bleak-retry-connector and bleak-connection-manager, so one install
+    serves every BLE service on the box.  This is the standalone fallback —
+    a bare clone, a dev machine, the test suite — and it must never shadow
+    a stack the interpreter already has.
+
+    Order matters.  The ``sys.modules`` check comes first because it is
+    cheap and because it is what lets the tests stub the package: a
+    ModuleType with ``__spec__ = None`` makes ``find_spec`` raise
+    ValueError, which is why that is caught alongside ImportError.  A weird
+    interpreter state degrades to "insert the ext paths", the safe
+    direction — worst case we shadow the shim with the vendored copy,
+    never run with no stack at all.
+    """
+    if "bleak_connection_manager" in sys.modules:
+        return
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("bleak_connection_manager") is not None:
+            return
+    except (ImportError, ValueError):
+        pass
+
+    ext = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
+    for sub in [
+        os.path.join(ext, "bleak-connection-manager", "src"),
+        os.path.join(ext, "bleak-connection-manager", "ext"),
+        os.path.join(ext, "bleak-retry-connector", "src"),
+        os.path.join(ext, "bluetooth-adapters", "src"),
+        os.path.join(ext, "aiooui", "src"),
+        os.path.join(ext, "bleak"),
+    ]:
+        if os.path.isdir(sub) and sub not in sys.path:
+            sys.path.insert(0, sub)
 
 
 def parse_bool(raw: str | None, default: bool = False) -> bool:
@@ -172,6 +214,11 @@ def install_ble_connection_manager(
     A failed install is logged and swallowed: the catcher is coordination,
     and connecting uncoordinated beats not connecting at all.
     """
+    # Before the enabled check: the BLE stack has to be importable even when
+    # the catcher is switched off, because power_watchdog_ble imports bleak
+    # either way.  Under the shim this is a no-op.
+    _ensure_ble_stack()
+
     if settings is None:
         settings = load_ble_settings()
 

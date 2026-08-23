@@ -8,4 +8,15 @@ sleep 3
 
 echo "Starting Power Watchdog discovery service..."
 cd /data/apps/dbus-power-watchdog
-exec python3 -u dbus-power-watchdog.py
+
+# Run on the shared BCM stack: the shim puts /data/bcm's bleak,
+# bleak-retry-connector and bleak-connection-manager on PYTHONPATH, so one
+# checkout serves every BLE service on the box instead of each vendoring its
+# own. It also exports BCM_AUTOWIRE=0 — a shim-launched process is a
+# deliberate consumer that installs the catcher itself, with its own owner
+# and adapter config. Falls back to plain python3, which leaves the service
+# on whatever this repo still vendors under ext/ (see _ensure_ble_stack).
+BCM_PY=/data/bcm/python3
+[ -x "$BCM_PY" ] || BCM_PY=python3
+echo "Interpreter: $BCM_PY"
+exec "$BCM_PY" -u dbus-power-watchdog.py

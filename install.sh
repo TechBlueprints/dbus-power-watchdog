@@ -138,6 +138,47 @@ else
 fi
 echo ""
 
+# Step 3b: Converge the shared bleak-connection-manager install.
+#
+# One checkout under /data/bcm serves the BLE stack (bleak,
+# bleak-retry-connector, bleak-connection-manager) to every BLE service on
+# the box, and service/run execs through its interpreter shim.  The vendored
+# ext/ trees above stay as the standalone fallback for a bare clone.
+#
+# Idempotent, and safe when another consumer already installed it: --ff-only
+# means a stale installer can never move the fleet backwards.  --autowire is
+# deliberately NOT passed -- planting the sitewide import hook is a per-box
+# decision for the operator, not something a consumer installer makes for them.
+echo "Step 3b: Converging the shared BLE stack (/data/bcm)..."
+BCM_DIR=/data/bcm
+BCM_REPO="https://github.com/TechBlueprints/bleak-connection-manager"
+BCM_OK=true
+
+if [ -d "$BCM_DIR/.git" ]; then
+    git -C "$BCM_DIR" fetch -q origin && \
+        git -C "$BCM_DIR" merge -q --ff-only origin/main || BCM_OK=false
+else
+    git clone -q "$BCM_REPO" "$BCM_DIR" || BCM_OK=false
+fi
+
+if [ "$BCM_OK" = true ]; then
+    # Unpiped on purpose: piping through tail/tee eats the exit code, and a
+    # failed smoke import must surface as an installer failure -- install.sh
+    # leaves the old shim in place and prints the rollback command.
+    "$BCM_DIR/install.sh"
+    if [ $? -ne 0 ]; then
+        BCM_OK=false
+    fi
+fi
+
+if [ "$BCM_OK" = true ]; then
+    echo "Shared BLE stack ready ($(git -C "$BCM_DIR" rev-parse --short HEAD))"
+else
+    echo "WARNING: could not converge the shared BLE stack at $BCM_DIR."
+    echo "The service will fall back to the vendored ext/ copies."
+fi
+echo ""
+
 # Step 4: Run enable script
 echo "Step 4: Enabling service..."
 bash "$INSTALL_DIR/enable.sh"

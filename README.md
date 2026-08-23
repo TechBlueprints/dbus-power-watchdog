@@ -111,8 +111,18 @@ adapter-bound, claiming scanner instead.
 - Python 3 (included with Venus OS)
 - Git (for cloning; the installer will install it via `opkg` if needed)
 
-All BLE dependencies are vendored as git submodules in `ext/` — no pip
-installs or external package management required:
+In production the BLE stack comes from the **shared install at `/data/bcm`**:
+one bleak-connection-manager checkout serves every BLE service on the GX, and
+`service/run` execs through its interpreter shim (`/data/bcm/python3`), which
+puts bleak, bleak-retry-connector and bleak-connection-manager on `PYTHONPATH`.
+`install.sh` converges that checkout (clone, or fetch + `--ff-only`) and runs
+its installer.  This is what keeps every BLE service on the box speaking one
+version of the claims convention.
+
+The submodules in `ext/` remain as the **standalone fallback**, so a bare
+clone still runs — `power_watchdog_ble_manager._ensure_ble_stack()` puts them
+on `sys.path` only when the interpreter does not already provide the stack.
+No pip installs or external package management required either way:
 
 | Submodule | Purpose |
 |-----------|---------|
