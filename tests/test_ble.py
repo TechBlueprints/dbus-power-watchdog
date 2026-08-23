@@ -776,7 +776,14 @@ class TestValidatePowerWatchdogGatt:
 
     def test_exported_validator_tolerates_late_gatt(self):
         # v1 waited out chips that register vendor services seconds after
-        # ServicesResolved; v2 makes that wrapper explicit, so it must
-        # actually be applied and not silently dropped.
-        assert VALIDATE_CONNECTION is not validate_power_watchdog_gatt
+        # ServicesResolved; v2 makes that wrapper explicit, so it must be
+        # applied whenever the library is importable. The connection manager
+        # is not vendored, so on a bare clone there is nothing to wrap and
+        # the raw validator stands in — still correct, just without the wait.
+        import power_watchdog_ble
+
         assert asyncio.iscoroutinefunction(VALIDATE_CONNECTION)
+        if power_watchdog_ble.tolerate_late_gatt is None:
+            assert VALIDATE_CONNECTION is validate_power_watchdog_gatt
+        else:
+            assert VALIDATE_CONNECTION is not validate_power_watchdog_gatt

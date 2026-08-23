@@ -119,17 +119,21 @@ puts bleak, bleak-retry-connector and bleak-connection-manager on `PYTHONPATH`.
 its installer.  This is what keeps every BLE service on the box speaking one
 version of the claims convention.
 
-The submodules in `ext/` remain as the **standalone fallback**, so a bare
-clone still runs — `power_watchdog_ble_manager._ensure_ble_stack()` puts them
-on `sys.path` only when the interpreter does not already provide the stack.
-No pip installs or external package management required either way:
+bleak-connection-manager is **not vendored or pinned by this repo** — a
+private pin is how a service drifts onto a different version of the claims
+convention than the rest of the fleet. The submodules in `ext/` remain only
+as the **standalone fallback** so a bare clone still has a `bleak` to import;
+`power_watchdog_ble_manager._ensure_ble_stack()` adds them to `sys.path` only
+when the interpreter does not already provide the stack. Without a shared
+install the catcher import simply fails and the service connects
+uncoordinated. No pip installs or external package management required
+either way:
 
 | Submodule | Purpose |
 |-----------|---------|
 | `velib_python` | Victron D-Bus service helper library |
 | `bleak` | Cross-platform BLE client library |
 | `bleak-retry-connector` | Connection retry logic with exponential backoff |
-| `bleak-connection-manager` | v2 "bleak catcher": claim-aware adapter routing installed underneath every bleak client |
 | `bluetooth-adapters` | HCI adapter enumeration |
 | `aiooui` | OUI (MAC vendor) lookups |
 

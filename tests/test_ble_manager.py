@@ -291,8 +291,11 @@ class TestEnsureBleStack:
         _ensure_ble_stack()
         inserted = _ext_paths_in(sys.path)
         assert inserted, "expected the vendored ext/ paths to be inserted"
-        assert any(p.endswith(os.path.join("bleak-connection-manager", "src"))
-                   for p in inserted)
+        # bleak itself is what the fallback has to supply; the connection
+        # manager is deliberately NOT vendored — it comes from /data/bcm or
+        # not at all, and its absence degrades to connecting uncoordinated.
+        assert any(p.endswith(os.sep + "bleak") for p in inserted)
+        assert not any("bleak-connection-manager" in p for p in inserted)
 
     def test_find_spec_valueerror_degrades_to_inserting(self, monkeypatch):
         # A stubbed module with __spec__ = None makes find_spec raise

@@ -98,7 +98,6 @@ cd "$INSTALL_DIR"
 # Required submodules and their fallback clone URLs
 SUBMODULES="
 velib_python|https://github.com/victronenergy/velib_python.git
-bleak-connection-manager|https://github.com/TechBlueprints/bleak-connection-manager.git
 bleak-retry-connector|https://github.com/Bluetooth-Devices/bleak-retry-connector.git
 bleak|https://github.com/hbldh/bleak.git
 bluetooth-adapters|https://github.com/Bluetooth-Devices/bluetooth-adapters.git
@@ -122,7 +121,7 @@ git submodule update --init --recursive 2>/dev/null && {
 
 # Verify critical dependencies
 MISSING=""
-for dep in velib_python/vedbus.py bleak/bleak/__init__.py bleak-connection-manager/src/bleak_connection_manager/__init__.py bleak-retry-connector/src/bleak_retry_connector/__init__.py; do
+for dep in velib_python/vedbus.py bleak/bleak/__init__.py bleak-retry-connector/src/bleak_retry_connector/__init__.py; do
     if [ ! -f "ext/$dep" ]; then
         MISSING="$MISSING  ext/$dep\n"
     fi
@@ -140,10 +139,12 @@ echo ""
 
 # Step 3b: Converge the shared bleak-connection-manager install.
 #
-# One checkout under /data/bcm serves the BLE stack (bleak,
+# The connection manager is NOT vendored by this repo -- this is where it
+# comes from. One checkout under /data/bcm serves the BLE stack (bleak,
 # bleak-retry-connector, bleak-connection-manager) to every BLE service on
-# the box, and service/run execs through its interpreter shim.  The vendored
-# ext/ trees above stay as the standalone fallback for a bare clone.
+# the box, and service/run execs through its interpreter shim, so nothing
+# here can pin the fleet to a private version. The ext/ trees above remain
+# only so a bare clone still has a bleak to import.
 #
 # Idempotent, and safe when another consumer already installed it: --ff-only
 # means a stale installer can never move the fleet backwards.  --autowire is
@@ -153,6 +154,7 @@ echo "Step 3b: Converging the shared BLE stack (/data/bcm)..."
 BCM_DIR=/data/bcm
 BCM_REPO="https://github.com/TechBlueprints/bleak-connection-manager"
 BCM_OK=true
+BCM_BEFORE=$(git -C "$BCM_DIR" rev-parse HEAD 2>/dev/null || echo "none")
 
 if [ -d "$BCM_DIR/.git" ]; then
     git -C "$BCM_DIR" fetch -q origin && \
@@ -172,7 +174,14 @@ if [ "$BCM_OK" = true ]; then
 fi
 
 if [ "$BCM_OK" = true ]; then
+    BCM_AFTER=$(git -C "$BCM_DIR" rev-parse HEAD 2>/dev/null || echo "none")
     echo "Shared BLE stack ready ($(git -C "$BCM_DIR" rev-parse --short HEAD))"
+    # The service loads the shared stack at import time, so a moved checkout
+    # only takes effect on restart -- and the repo itself may be unchanged.
+    if [ "$BCM_BEFORE" != "$BCM_AFTER" ]; then
+        echo "Shared BLE stack moved ${BCM_BEFORE:-none} -> $BCM_AFTER; service restart required"
+        NEEDS_RESTART=true
+    fi
 else
     echo "WARNING: could not converge the shared BLE stack at $BCM_DIR."
     echo "The service will fall back to the vendored ext/ copies."

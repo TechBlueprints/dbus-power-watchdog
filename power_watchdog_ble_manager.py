@@ -48,12 +48,20 @@ CLAIM_OWNER = "dbus-power-watchdog"
 def _ensure_ble_stack() -> None:
     """Put the vendored ext/ BLE stack on sys.path unless already provided.
 
-    In production the shared checkout provides it: the run script execs
-    through ``/data/bcm/python3``, whose PYTHONPATH already carries bleak,
-    bleak-retry-connector and bleak-connection-manager, so one install
-    serves every BLE service on the box.  This is the standalone fallback —
-    a bare clone, a dev machine, the test suite — and it must never shadow
-    a stack the interpreter already has.
+    The connection manager is deliberately not vendored here: it comes from
+    the shared ``/data/bcm`` checkout, which ``install.sh`` converges and
+    whose interpreter shim ``service/run`` execs through.  Pinning our own
+    copy is precisely the drift the shared install exists to prevent — one
+    service lagging on a private pin ends up writing claim files the rest of
+    the fleet does not read.
+
+    So this covers only the standalone fallback — a bare clone, a dev
+    machine, the test suite — where bleak and bleak-retry-connector still
+    have to come from somewhere.  With no shared install the catcher import
+    simply fails and the service connects uncoordinated, which is the
+    documented degradation.  Importability of ``bleak_connection_manager``
+    is the sentinel for "the shim already supplied everything", so this must
+    never shadow a stack the interpreter already has.
 
     Order matters.  The ``sys.modules`` check comes first because it is
     cheap and because it is what lets the tests stub the package: a
@@ -75,8 +83,6 @@ def _ensure_ble_stack() -> None:
 
     ext = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
     for sub in [
-        os.path.join(ext, "bleak-connection-manager", "src"),
-        os.path.join(ext, "bleak-connection-manager", "ext"),
         os.path.join(ext, "bleak-retry-connector", "src"),
         os.path.join(ext, "bluetooth-adapters", "src"),
         os.path.join(ext, "aiooui", "src"),

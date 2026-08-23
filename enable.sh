@@ -15,7 +15,7 @@ chmod +x "$INSTALL_DIR/service/log/run"
 
 # Verify critical submodules are present
 DEPS_OK=true
-for dep in velib_python/vedbus.py bleak/bleak/__init__.py bleak-connection-manager/src/bleak_connection_manager/__init__.py; do
+for dep in velib_python/vedbus.py bleak/bleak/__init__.py; do
     if [ ! -f "$INSTALL_DIR/ext/$dep" ]; then
         echo "WARNING: Missing dependency ext/$dep"
         DEPS_OK=false
