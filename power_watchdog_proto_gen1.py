@@ -124,9 +124,14 @@ class Gen1Protocol:
         ble._gen1_first_chunk = None
         merged = first + bytes(data)
 
+        # A structurally valid packet is the liveness signal.  Deliberately
+        # not every raw frame: a link streaming garbage is as dead as a
+        # silent one, and stamping on garbage would hide that from the
+        # notification watchdog (which is how a parse regression once hid
+        # for 900s at a time behind the process-restart backstop).
         wd = getattr(ble, "_watchdog", None)
         if wd is not None:
-            wd.notify_activity()
+            wd.record_activity()
 
         parse_gen1_telemetry(ble, merged)
 

@@ -299,3 +299,27 @@ class TestGen1NameVersionPreset:
         parse_gen1_telemetry(ble, m)
         data = ble.get_data()
         assert abs(data.l1.voltage - 120.0) < 0.01
+
+
+# ── Watchdog integration (the 2026-08-26 regression) ──────────────────────
+#
+# Same regression class as gen2: ble._watchdog was never set in tests, so
+# the getattr guard skipped the stamp and the stale v1 method name
+# (`notify_activity`) went unnoticed until production.
+
+from power_watchdog_ble import NotificationWatchdog
+
+
+class TestGen1WatchdogIntegration:
+    def test_merged_chunks_stamp_a_real_watchdog(self):
+        ble, proto = _make_ble_instance()
+        ble._watchdog = NotificationWatchdog(timeout=60.0, on_timeout=None)
+        ble._watchdog.last_activity = 0.0
+
+        merged = _build_gen1_merged(voltage_v=119.5, frequency_hz=60.0)
+        chunk1, chunk2 = _gen1_chunks(merged)
+        proto.notification_handler(ble, None, chunk1)
+        proto.notification_handler(ble, None, chunk2)
+
+        assert ble._watchdog.last_activity > 0.0
+        assert ble.get_data().timestamp > 0

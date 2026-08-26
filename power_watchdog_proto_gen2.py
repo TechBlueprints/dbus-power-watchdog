@@ -170,9 +170,14 @@ class Gen2Protocol:
                 )
             return True
 
+        # A structurally valid packet is the liveness signal.  Deliberately
+        # not every raw frame: a link streaming garbage is as dead as a
+        # silent one, and stamping on garbage would hide that from the
+        # notification watchdog (which is how a parse regression once hid
+        # for 900s at a time behind the process-restart backstop).
         wd = getattr(ble, "_watchdog", None)
         if wd is not None:
-            wd.notify_activity()
+            wd.record_activity()
 
         if cmd == CMD_DL_REPORT:
             _parse_dl_report(ble, body, raw_hex)

@@ -326,3 +326,39 @@ class TestNotificationHandler:
 
         assert abs(snap1.l1.voltage - 120.0) < 0.01
         assert abs(snap2.l1.voltage - 130.0) < 0.01
+
+
+# ── Watchdog integration (the 2026-08-26 regression) ──────────────────────
+#
+# Every earlier test left ble._watchdog unset, so the proto's
+# getattr(ble, "_watchdog", None) guard silently skipped the stamp call —
+# which is how `wd.notify_activity()` (the v1 method name) survived the v2
+# migration and crashed on every frame in production. These run the parse
+# with a real NotificationWatchdog attached.
+
+from power_watchdog_ble import NotificationWatchdog
+
+
+class TestGen2WatchdogIntegration:
+    def test_valid_packet_stamps_a_real_watchdog(self):
+        ble, proto = _make_ble_instance()
+        ble._watchdog = NotificationWatchdog(timeout=60.0, on_timeout=None)
+        ble._watchdog.last_activity = 0.0
+
+        body = _build_dl_data(voltage_v=120.0)
+        packet = _build_packet(CMD_DL_REPORT, body)
+        proto.notification_handler(ble, None, bytearray(packet))
+
+        assert ble._watchdog.last_activity > 0.0
+        assert ble.get_data().timestamp > 0
+
+    def test_garbage_does_not_stamp(self):
+        # A link streaming garbage is as dead as a silent one: only a
+        # structurally valid packet counts as liveness.
+        ble, proto = _make_ble_instance()
+        ble._watchdog = NotificationWatchdog(timeout=60.0, on_timeout=None)
+        ble._watchdog.last_activity = 0.0
+
+        proto.notification_handler(ble, None, bytearray(b"\x00" * 40))
+
+        assert ble._watchdog.last_activity == 0.0

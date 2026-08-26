@@ -770,14 +770,34 @@ class PowerWatchdogBLE:
                     name=self.address,
                 )
 
-                # Subscribe to notifications.  Every frame stamps the
-                # watchdog, parseable or not: silence is the failure this
-                # watches for, and an unparseable frame is not silence.
-                def handler(sender, data, _proto=proto):
-                    watchdog = self._watchdog
-                    if watchdog is not None:
-                        watchdog.record_activity()
-                    _proto.notification_handler(self, sender, data)
+                # Subscribe to notifications.  The watchdog is stamped by
+                # the protocol handlers on structurally valid packets, not
+                # here on raw frames: a link streaming garbage is as dead
+                # as a silent one, and a raw-frame stamp would hide a parse
+                # failure from the watchdog — with only the daemon's 900s
+                # process-restart backstop left to notice (2026-08-26).
+                #
+                # The try/except is the other half of the same lesson: an
+                # exception here otherwise unwinds into dbus_fast's message
+                # pump, which logs it under its own name and swallows it,
+                # leaving this session loop running and none the wiser.
+                # First failure logs the traceback; the rest are counted,
+                # because at polling rates a per-frame traceback churns the
+                # log rotation fast enough to destroy the evidence.
+                parse_failures = {"count": 0}
+
+                def handler(sender, data, _proto=proto, _pf=parse_failures):
+                    try:
+                        _proto.notification_handler(self, sender, data)
+                    except Exception:
+                        _pf["count"] += 1
+                        if _pf["count"] == 1:
+                            logger.exception(
+                                "Notification handler failed for %s "
+                                "(further failures this session are "
+                                "counted, not logged)",
+                                self.address,
+                            )
 
                 logger.info("Subscribing to notifications on %s", notify_uuid)
                 try:
@@ -812,6 +832,12 @@ class PowerWatchdogBLE:
                     await self._interruptible_sleep(1.0)
 
                 self._connected = False
+                if parse_failures["count"] > 1:
+                    logger.warning(
+                        "%d notification handler failures during this "
+                        "session for %s (first was logged with traceback)",
+                        parse_failures["count"], self.address,
+                    )
                 if not self._running:
                     logger.info(
                         "BLE session end for %s: service stopping",
