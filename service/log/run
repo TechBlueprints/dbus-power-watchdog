@@ -1,3 +1,10 @@
 #!/bin/sh
 exec 2>&1
-exec multilog t s25000 n4 /var/log/dbus-power-watchdog
+# 30 MB retained (s1500000 n20), up from 100 kB. Size against the INCIDENT
+# rate, not the idle rate: a crash loop is a high-log-rate condition, so
+# small retention evicts the history of the very failure being read about —
+# the 2026-08-26 crash loop's own fingerprint rotated away in minutes.
+# s/n control only how much history is KEPT, not how much is written, and
+# /var/log/dbus-power-watchdog lives on /data (disk), not tmpfs. Same
+# sizing as dbus-easytouchrv, which hit the identical wall first.
+exec multilog t s1500000 n20 /var/log/dbus-power-watchdog
