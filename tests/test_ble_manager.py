@@ -241,3 +241,92 @@ class TestImportSideEffects:
 
         assert bleak.BleakClient.__module__.startswith("bleak")
         assert "bleak_connection_manager" not in bleak.BleakClient.__module__
+
+
+# ── MAC-named adapters (2026-08-27) ───────────────────────────────────────
+#
+# hciN is not an identity: a replug or reboot renumbers the cards. Adapters
+# are named by MAC in config and translated to the current hciN as late as
+# possible, because bleak's adapter= kwarg accepts nothing else.
+
+from power_watchdog_ble_manager import resolve_adapter  # noqa: E402
+
+
+@pytest.fixture
+def stub_claims(monkeypatch):
+    """Stand in for bleak_connection_manager.claims with a fixed mapping."""
+
+    def _install(mapping, raises=False):
+        calls = []
+
+        def hci_for(entry, fresh=True):
+            calls.append((entry, fresh))
+            if raises:
+                raise RuntimeError("hciconfig unavailable")
+            return mapping.get(entry)
+
+        claims = types.ModuleType("bleak_connection_manager.claims")
+        claims.hci_for = hci_for
+        pkg = types.ModuleType("bleak_connection_manager")
+        pkg.claims = claims
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager", pkg)
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager.claims", claims)
+        return calls
+
+    return _install
+
+
+class TestResolveAdapter:
+    def test_mac_resolves_to_current_hci(self, stub_claims):
+        stub_claims({"00:1A:7D:DA:71:07": "hci2"})
+        assert resolve_adapter("00:1A:7D:DA:71:07") == "hci2"
+
+    def test_same_mac_can_resolve_elsewhere_after_renumber(self, stub_claims):
+        # The whole point: the card moved, the config did not.
+        stub_claims({"00:1A:7D:DA:71:07": "hci5"})
+        assert resolve_adapter("00:1A:7D:DA:71:07") == "hci5"
+
+    def test_hci_name_still_accepted(self, stub_claims):
+        stub_claims({"hci2": "hci2"})
+        assert resolve_adapter("hci2") == "hci2"
+
+    def test_absent_card_yields_none_not_a_bogus_adapter(self, stub_claims):
+        # Handing bleak an unresolvable MAC, or an hciN that now belongs to
+        # another radio, is worse than letting it choose.
+        stub_claims({})
+        assert resolve_adapter("00:1A:7D:DA:71:07") is None
+
+    def test_lookup_failure_yields_none(self, stub_claims):
+        stub_claims({}, raises=True)
+        assert resolve_adapter("00:1A:7D:DA:71:07") is None
+
+    def test_resolution_is_fresh(self, stub_claims):
+        # A cached answer is useless for a value whose whole premise is
+        # that it changes.
+        calls = stub_claims({"00:1A:7D:DA:71:07": "hci2"})
+        resolve_adapter("00:1A:7D:DA:71:07")
+        assert calls == [("00:1A:7D:DA:71:07", True)]
+
+    def test_no_shared_stack_uses_the_entry_verbatim(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager", None)
+        assert resolve_adapter("hci2") == "hci2"
+
+    def test_empty_entry(self):
+        assert resolve_adapter(None) is None
+        assert resolve_adapter("") is None
+
+
+class TestScanAdapterForWithMacs:
+    def test_device_pinned_to_a_mac_named_card(self, stub_claims):
+        stub_claims({"00:1A:7D:DA:71:07": "hci2"})
+        entries = ["24:EC:4A:E4:69:A5@00:1A:7D:DA:71:07"]
+        assert scan_adapter_for("24:EC:4A:E4:69:A5", entries) == "hci2"
+
+    def test_mac_pool_entry(self, stub_claims):
+        stub_claims({"00:1A:7D:DA:71:07": "hci2"})
+        assert scan_adapter_for("AA:BB", ["00:1A:7D:DA:71:07"]) == "hci2"
+
+    def test_pin_still_wins_over_pool(self, stub_claims):
+        stub_claims({"00:1A:7D:DA:71:07": "hci2", "68:4E:05:44:77:B0": "hci0"})
+        entries = ["68:4E:05:44:77:B0", "AA:BB@00:1A:7D:DA:71:07"]
+        assert scan_adapter_for("AA:BB", entries) == "hci2"

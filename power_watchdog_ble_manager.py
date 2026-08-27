@@ -128,6 +128,49 @@ def split_adapters(entries: list[str]) -> tuple[dict[str, list[str]], list[str]]
     return pins, pool
 
 
+def resolve_adapter(entry: str | None) -> str | None:
+    """Translate an adapter entry to the ``hciN`` it answers to right now.
+
+    Adapters should be named by MAC, never by ``hciN``: the index is not an
+    identity — a USB replug or a reboot renumbers the cards, and a stale
+    number silently points at a different radio.  This service has already
+    been bitten by that (a config pinned to hci1 while the unit was heard
+    on another card, 2026-08-25).
+
+    But bleak's BlueZ backend only accepts ``adapter="hciN"``, so the
+    translation has to happen as late as possible, right at the call.  The
+    library's ``claims.hci_for()`` resolves against the live numbering for
+    exactly this reason, and is deliberately not cached.
+
+    Returns None — meaning "let bleak choose" — when a configured card is
+    not present, which beats handing bleak a MAC it cannot parse or an
+    hciN that now belongs to someone else's radio.
+    """
+    if not entry:
+        return None
+    try:
+        from bleak_connection_manager import claims
+    except Exception:
+        # No shared stack: the entry can only be used as written.
+        return entry
+
+    try:
+        resolved = claims.hci_for(entry)
+    except Exception:
+        logger.exception("Adapter lookup failed for '%s'", entry)
+        return None
+
+    if resolved is None:
+        logger.warning(
+            "Configured adapter '%s' is not present; letting bleak choose",
+            entry,
+        )
+        return None
+    if resolved != entry:
+        logger.info("Adapter %s is currently %s", entry, resolved)
+    return resolved
+
+
 def scan_adapter_for(address: str | None, entries: list[str]) -> str | None:
     """The adapter our own scans should use, or None for bleak's default.
 
@@ -137,13 +180,20 @@ def scan_adapter_for(address: str | None, entries: list[str]) -> str | None:
     resolves to an hci1 D-Bus path, and that path is what bleak connects
     over.  A pinned device gets its first pinned adapter; anything else
     gets the first pool entry.
+
+    Entries name adapters by MAC (``hciN`` still parses, for compatibility);
+    the result is translated to the current ``hciN`` by
+    :func:`resolve_adapter`, because that is the only form bleak accepts.
     """
     pins, pool = split_adapters(entries)
+    chosen = None
     if address:
         pinned = pins.get(str(address).strip().upper())
         if pinned:
-            return pinned[0]
-    return pool[0] if pool else None
+            chosen = pinned[0]
+    if chosen is None and pool:
+        chosen = pool[0]
+    return resolve_adapter(chosen)
 
 
 def load_ble_settings(config_dir: str | None = None) -> dict[str, str]:
