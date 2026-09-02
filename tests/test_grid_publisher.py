@@ -619,3 +619,84 @@ class TestPreData:
         assert svc._values["/Ac/L1/Voltage"] is None
         # /UpdateIndex stays at 0 (gated inside the data branch)
         assert svc._values["/UpdateIndex"] is None or svc._values["/UpdateIndex"] == 0
+
+
+# ── /LastUpdate: the freshness flag that cannot lie ───────────────────────
+#
+# /Connected reads 1 while a link carries nothing, and /UpdateIndex is gated
+# behind the flicker-suppression steps, so a flat load holds it still even
+# with fresh frames.  /LastUpdate is written from data.timestamp — set only
+# when a frame actually PARSED — at most once per LAST_UPDATE_INTERVAL.
+
+
+def _lastupdate_svc() -> FakeVeDbusService:
+    svc = FakeVeDbusService()
+    _full_grid_paths(svc)
+    svc.add_path("/LastUpdate")
+    return svc
+
+
+class TestLastUpdate:
+    def test_first_parsed_frame_writes_it(self):
+        svc = _lastupdate_svc()
+        pub = gp.GridPublisher()
+        pub.publish(svc, _Snapshot(timestamp=1000.7), connected=True)
+        assert svc._values["/LastUpdate"] == 1000
+
+    def test_not_rewritten_within_the_interval(self):
+        svc = _lastupdate_svc()
+        pub = gp.GridPublisher()
+        snap = _Snapshot(l1=_Line(voltage=120.0, current=10.0, power=1200.0))
+        snap.timestamp = 1000.0
+        pub.publish(svc, snap, connected=True)
+        idx = svc._values["/UpdateIndex"]
+        for t in range(1, int(gp.LAST_UPDATE_INTERVAL)):
+            snap.timestamp = 1000.0 + t
+            pub.publish(svc, snap, connected=True)
+        assert svc._values["/LastUpdate"] == 1000
+        # Flat data + throttled stamp = no D-Bus churn at all.
+        assert svc._values["/UpdateIndex"] == idx
+
+    def test_rewritten_after_the_interval_and_bumps_update_index(self):
+        # A flat load must still prove liveness at least once a minute.
+        svc = _lastupdate_svc()
+        pub = gp.GridPublisher()
+        snap = _Snapshot(l1=_Line(voltage=120.0, current=10.0, power=1200.0))
+        snap.timestamp = 1000.0
+        pub.publish(svc, snap, connected=True)
+        idx = svc._values["/UpdateIndex"]
+        snap.timestamp = 1000.0 + gp.LAST_UPDATE_INTERVAL
+        pub.publish(svc, snap, connected=True)
+        assert svc._values["/LastUpdate"] == 1000 + int(gp.LAST_UPDATE_INTERVAL)
+        assert svc._values["/UpdateIndex"] == idx + 1
+
+    def test_dead_parser_never_advances_it(self):
+        # The 2026-08-26 shape: connected, link alive, zero frames parsed.
+        svc = _lastupdate_svc()
+        pub = gp.GridPublisher()
+        for _ in range(100):
+            pub.publish(svc, _Snapshot(timestamp=0.0), connected=True)
+        assert svc._values["/LastUpdate"] is None
+
+    def test_not_written_while_disconnected(self):
+        svc = _lastupdate_svc()
+        pub = gp.GridPublisher()
+        pub.publish(svc, _Snapshot(timestamp=1000.0), connected=False)
+        assert svc._values["/LastUpdate"] is None
+
+    def test_reset_allows_an_immediate_rewrite(self):
+        svc = _lastupdate_svc()
+        pub = gp.GridPublisher()
+        pub.publish(svc, _Snapshot(timestamp=1000.0), connected=True)
+        pub.reset()
+        svc._values["/LastUpdate"] = None
+        pub.publish(svc, _Snapshot(timestamp=1001.0), connected=True)
+        assert svc._values["/LastUpdate"] == 1001
+
+    def test_undeclared_path_is_skipped(self):
+        # The standalone CLI may not declare it; must not raise.
+        svc = FakeVeDbusService()
+        _full_grid_paths(svc)
+        pub = gp.GridPublisher()
+        pub.publish(svc, _Snapshot(timestamp=1000.0), connected=True)
+        assert "/LastUpdate" not in svc._values

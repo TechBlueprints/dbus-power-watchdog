@@ -71,6 +71,15 @@ from __future__ import annotations
 GRID_VOLTAGE_STEP = 0.5     # V — grid is 120 V ±5%; 0.5 V resolution still useful
 GRID_CURRENT_STEP = 0.05    # A — kills 10-50 mA noise; 50 mA = ~6 W at 120 V
 GRID_POWER_STEP = 5         # W — kills 1-2 W noise; useful loads are ≥ 5 W anyway
+
+# How often /LastUpdate is rewritten while parsed telemetry flows.  It is
+# the freshness signal the flicker-suppressed measurement paths cannot be:
+# a flat load leaves them (and therefore /UpdateIndex) unchanged for as
+# long as it stays flat, which is indistinguishable from a parser that has
+# stopped producing.  One write a minute is a bounded D-Bus cost and makes
+# /UpdateIndex advance at least that often whenever real frames are being
+# parsed — and never when they are not.
+LAST_UPDATE_INTERVAL = 60.0  # seconds
 GRID_FREQ_STEP = 0.1        # Hz — frequency is genuinely stable, no coarsening
 GRID_ENERGY_STEP = 0.01     # kWh — counter, monotone, fine resolution useful
 
@@ -163,6 +172,8 @@ class GridPublisher:
     def __init__(self) -> None:
         self._update_index: int = 0
         self._last_values: dict[str, object] = {}
+        # Epoch of the last /LastUpdate we wrote; 0 forces the first write.
+        self._last_update_published: float = 0.0
 
     def reset(self) -> None:
         """Drop the dedup cache and reset ``/UpdateIndex``.
@@ -173,6 +184,7 @@ class GridPublisher:
         """
         self._update_index = 0
         self._last_values.clear()
+        self._last_update_published = 0.0
 
     def _set_if_changed(self, ctx, path: str, value) -> bool:
         """Write *value* to *ctx[path]* iff the local cache shows it
@@ -247,6 +259,16 @@ class GridPublisher:
                 return any_changed
 
             if data.timestamp > 0:
+                # Freshness, throttled.  data.timestamp is set only when a
+                # frame actually PARSED, so this is the one path that can
+                # not read as healthy while the parser is dead — the
+                # failure that kept /Connected=1 and a live link green for
+                # 15-minute cycles on 2026-08-26.
+                if data.timestamp - self._last_update_published >= LAST_UPDATE_INTERVAL:
+                    any_changed |= self._set_if_changed(
+                        ctx, "/LastUpdate", int(data.timestamp))
+                    self._last_update_published = data.timestamp
+
                 l1 = data.l1
                 any_changed |= self._set_if_changed(
                     ctx, "/Ac/L1/Voltage",

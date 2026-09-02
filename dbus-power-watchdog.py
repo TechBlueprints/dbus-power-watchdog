@@ -788,6 +788,10 @@ class PowerWatchdogService:
         svc.add_path("/Position", self._grid_settings["position"],
                       writeable=True, onchangecallback=self._on_position_changed)
         svc.add_path("/RefreshTime", self._update_interval_ms)
+        # Epoch of the last PARSED frame, rewritten at most once a minute.
+        # The freshness flag that cannot lie: /Connected and /UpdateIndex
+        # both can, for different reasons (see grid_publisher).
+        svc.add_path("/LastUpdate", None)
 
         svc.add_path("/Ac/Power", None, gettextcallback=_fmt_w)
         svc.add_path("/Ac/Current", None, gettextcallback=_fmt_a)
@@ -1165,13 +1169,22 @@ def main():
 
     mainloop = GLib.MainLoop()
 
-    def signal_handler(signum, frame):
+    # Shutdown runs as a mainloop source, not inside a Python signal
+    # handler.  A signal.signal() handler fires wherever the interpreter
+    # happens to be, including mid dbus_connection_dispatch on this same
+    # thread — and stop() closes the private grid bus, whose watches live on
+    # that dispatch.  Freeing a connection under its own dispatch is the
+    # same "close under dispatch" corruption that produced the fleet's
+    # dbus-python cores, just single-threaded.  GLib's unix signal source
+    # delivers the signal as an ordinary event at a dispatch boundary.
+    def on_shutdown_signal(signum):
         logger.info("Received signal %d, shutting down...", signum)
         service.stop()
         mainloop.quit()
+        return GLib.SOURCE_REMOVE
 
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signum, on_shutdown_signal, signum)
 
     logger.info("dbus-power-watchdog v%s started", VERSION)
 

@@ -266,6 +266,7 @@ class PowerWatchdogDeviceService:
 
         # Refresh time (measurement interval in ms)
         self._dbusservice.add_path("/RefreshTime", self._update_interval_ms)
+        self._dbusservice.add_path("/LastUpdate", None)
 
         # AC total paths
         self._dbusservice.add_path("/Ac/Power", None, gettextcallback=_fmt_w)
@@ -456,13 +457,16 @@ def main():
 
     mainloop = GLib.MainLoop()
 
-    def signal_handler(signum, frame):
+    # Delivered as a mainloop event at a dispatch boundary, never from
+    # inside dbus_connection_dispatch — see dbus-power-watchdog.py.
+    def on_shutdown_signal(signum):
         logger.info("Received signal %d, shutting down...", signum)
         service.stop()
         mainloop.quit()
+        return GLib.SOURCE_REMOVE
 
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signum, on_shutdown_signal, signum)
 
     logger.info(
         "power-watchdog-device v%s started for %s",

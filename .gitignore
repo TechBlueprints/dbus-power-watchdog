@@ -30,4 +30,7 @@ config.ini
 # Reference material
 sample-driver/
 
+# Local incident archive -- operational history, not part of the driver
+BLE-INCIDENTS-ARCHIVE.md
+
 # ext/velib_python is committed -- it's the standard Venus OS Python library

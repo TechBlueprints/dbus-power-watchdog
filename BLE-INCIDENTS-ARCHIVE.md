@@ -142,20 +142,26 @@ hourly timer and addresses exactly one MAC.
 
 ---
 
-## Still open — deliberately NOT expired
+## Formerly open — resolved 2026-09-02 on Clint's rulings
 
-These are not BLE errors and survive the cutoff:
-
-- **`_grid_bus.close()` reachable from the signal handler**
-  (`dbus-power-watchdog.py:845`). Same-thread D-Bus reentrancy: a signal can
-  interrupt the main thread inside `dbus_connection_dispatch` and free the
-  connection under it. Shutdown-path only. Flagged, not fixed.
-- **Offline poll cadence** — 300 s (20 s scan + 300 s sleep). Clint expected
-  900 s; the number is unreconciled, not wrong.
-- **Last-good-data timestamp path** — every existing health flag (`conn=1`,
-  relay Status, a live ACL link) was green during §3 while zero telemetry
-  parsed. A published last-good-data timestamp is the flag that cannot lie
-  that way.
-- **`InProgress` → "not found"** — a scan that raises still takes the fast
-  generic backoff with a traceback instead of the calm 300 s offline poll.
-  De-prioritised by §6, not obsolete.
+- **`_grid_bus.close()` from the signal handler** — fixed. Both entry points
+  now register SIGTERM/SIGINT with `GLib.unix_signal_add`, so shutdown runs
+  as a mainloop source at a dispatch boundary, never from inside
+  `dbus_connection_dispatch`. Ruling: "we should fix."
+- **Offline poll cadence** — stays 300 s. Ruling: "300 is ok, stick with it."
+- **Last-good-data timestamp** — implemented as `/LastUpdate` on the grid
+  service: epoch of the last PARSED frame, written at most once per 60 s.
+  BCM's notify work does not cover this — its "observed traffic" is
+  link-level (a raw notification arriving), which is exactly the signal
+  that read healthy during the §3 crash loop while nothing parsed. Only
+  the parser knows a frame parsed. `/UpdateIndex` was already truthful
+  (gated on real change, so it stood still during §3) but is throttled
+  by the flicker-suppression steps; `/LastUpdate` makes it tick at least
+  once a minute whenever real frames flow, and never when they do not.
+- **`InProgress` → "not found"** — no change. With `ble_wrap_scanner = true`
+  our scans hold the card's `.scan` claim, so BCM-aware co-tenants no
+  longer collide; only non-participants (Victron's C `dbus-ble-sensors`,
+  `bluetoothctl`) can still trigger it. A pinned device does not rotate
+  by design — one owner per card — so a collision retries the same card
+  after backoff, and since 60bbb39 that is one WARNING per 300 s, not a
+  traceback per attempt.
