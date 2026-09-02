@@ -787,3 +787,70 @@ class TestValidatePowerWatchdogGatt:
             assert VALIDATE_CONNECTION is validate_power_watchdog_gatt
         else:
             assert VALIDATE_CONNECTION is not validate_power_watchdog_gatt
+
+
+# ── BLE error logging (rate-limited, no stacks) ───────────────────────────
+#
+# A BlueZ refusal is an operating condition on a shared radio, not a defect.
+# 65% of this service's retained log was once a single ~15-line trace
+# repeated 362 times, which buried the history of the storm it documented.
+
+from power_watchdog_ble import BLE_ERROR_LOG_INTERVAL  # noqa: E402
+
+
+def _ble_for_errors() -> PowerWatchdogBLE:
+    ble = object.__new__(PowerWatchdogBLE)
+    ble.address = "AA:BB:CC:DD:EE:FF"
+    ble._ble_error_log = {}
+    return ble
+
+
+class TestBleErrorLogging:
+    def test_first_occurrence_logs(self, caplog):
+        ble = _ble_for_errors()
+        with caplog.at_level("WARNING"):
+            ble._log_ble_error(BleakError("[org.bluez.Error.InProgress] busy"), 10.0)
+        assert len(caplog.records) == 1
+        assert "InProgress" in caplog.text
+        assert "retrying in 10s" in caplog.text
+
+    def test_repeat_is_suppressed(self, caplog):
+        ble = _ble_for_errors()
+        with caplog.at_level("WARNING"):
+            for _ in range(50):
+                ble._log_ble_error(BleakError("[org.bluez.Error.InProgress] busy"), 10.0)
+        assert len(caplog.records) == 1, "a retry storm must not repeat itself"
+
+    def test_suppressed_count_is_reported_next_time(self, caplog):
+        ble = _ble_for_errors()
+        exc = BleakError("[org.bluez.Error.InProgress] busy")
+        ble._log_ble_error(exc, 10.0)
+        for _ in range(846):
+            ble._log_ble_error(exc, 10.0)
+        # Age the window out, then the next one reports the backlog.
+        key = list(ble._ble_error_log)[0]
+        _, suppressed = ble._ble_error_log[key]
+        ble._ble_error_log[key] = (
+            _time.monotonic() - BLE_ERROR_LOG_INTERVAL - 1, suppressed,
+        )
+        with caplog.at_level("WARNING"):
+            ble._log_ble_error(exc, 10.0)
+        assert "846 more since the last report" in caplog.text
+
+    def test_a_different_error_is_not_suppressed(self, caplog):
+        # Keyed by kind: a new failure must never hide behind an unrelated
+        # one already repeating.
+        ble = _ble_for_errors()
+        with caplog.at_level("WARNING"):
+            ble._log_ble_error(BleakError("[org.bluez.Error.InProgress] busy"), 10.0)
+            ble._log_ble_error(
+                BleakError('[org.freedesktop.DBus.Error.UnknownObject] gone'), 10.0,
+            )
+        assert len(caplog.records) == 2
+        assert "UnknownObject" in caplog.text
+
+    def test_no_stack_trace_is_emitted(self, caplog):
+        ble = _ble_for_errors()
+        with caplog.at_level("WARNING"):
+            ble._log_ble_error(BleakError("[org.bluez.Error.InProgress] busy"), 10.0)
+        assert caplog.records[0].exc_info is None

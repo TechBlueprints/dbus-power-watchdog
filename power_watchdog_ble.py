@@ -98,6 +98,11 @@ WATCHDOG_CHECK_INTERVAL = 5.0  # seconds
 # How long to scan when the BlueZ cache has no record of the device.
 SCAN_TIMEOUT = 20.0  # seconds
 
+# Minimum gap between repeats of the same BLE error kind.  A retry loop
+# against a busy or wedged radio can fail every few seconds for hours; the
+# first line carries the diagnosis and the rest only bury it.
+BLE_ERROR_LOG_INTERVAL = 300.0  # seconds
+
 
 class NotificationWatchdog:
     """Fire a callback when BLE notifications go quiet.
@@ -535,6 +540,10 @@ class PowerWatchdogBLE:
         # only a repeat concedes it is offline.
         self._notfound_streak = 0
 
+        # Rate-limit state for expected BLE errors: {(type, dbus name):
+        # (last log monotonic, suppressed count)}.  See _log_ble_error.
+        self._ble_error_log: dict[tuple[str, str], tuple[float, int]] = {}
+
         # Skip the BlueZ cache on the next resolve. BlueZ remembers devices
         # that have gone away, and connecting to a stale entry fails the
         # same way every time — without this, a stale entry would keep us
@@ -799,20 +808,16 @@ class PowerWatchdogBLE:
                                 self.address,
                             )
 
-                logger.info("Subscribing to notifications on %s", notify_uuid)
-                try:
-                    await asyncio.wait_for(
-                        client.start_notify(notify_uuid, handler),
-                        timeout=5.0,
-                    )
-                except Exception:
-                    logger.exception(
-                        "start_notify failed for %s (mode=%s)",
-                        notify_uuid,
-                        gatt_mode,
-                    )
-                    raise
-                logger.info("Notifications enabled on %s", notify_uuid)
+                logger.debug("Subscribing to notifications on %s", notify_uuid)
+                # No log-and-raise here: the session handler below logs it
+                # once, with the right severity for the error type.  Logging
+                # in both places is how one BlueZ refusal became two ~15-line
+                # stacks in the service log.
+                await asyncio.wait_for(
+                    client.start_notify(notify_uuid, handler),
+                    timeout=5.0,
+                )
+                logger.debug("Notifications enabled on %s", notify_uuid)
 
                 # Protocol-specific post-subscribe action (handshake or no-op)
                 await proto.after_subscribe(client, write_uuid, write_resp)
@@ -903,6 +908,18 @@ class PowerWatchdogBLE:
                     self.address, next_delay,
                 )
 
+            except BleakError as exc:
+                # A BlueZ refusal is an expected operating condition on a
+                # shared radio, not a program defect: the adapter is busy,
+                # the object path went stale, bluetoothd restarted. One
+                # WARNING line naming the error carries everything the stack
+                # would, and a 15-line trace per retry buries the history of
+                # the very storm you would read the log to understand — 65%
+                # of this service's retained log was once one such trace,
+                # repeated 362 times.
+                self._connected = False
+                self._log_ble_error(exc, delay)
+
             except Exception:
                 self._connected = False
                 logger.exception(
@@ -937,6 +954,36 @@ class PowerWatchdogBLE:
                 delay = min(delay * 1.5, self.reconnect_max_delay)
 
             await self._interruptible_sleep(next_delay)
+
+    def _log_ble_error(self, exc: BaseException, delay: float) -> None:
+        """Log one line for an expected BLE error, rate-limited per kind.
+
+        Keyed by error type plus its D-Bus error name, so a genuinely new
+        failure is never suppressed by an unrelated one already repeating.
+        While a kind is being suppressed the occurrences are counted and
+        reported with the next line it does emit, because "this happened
+        847 times" is the fact worth having — not 847 copies of it.
+        """
+        detail = str(exc).strip().splitlines()
+        detail = detail[0] if detail else exc.__class__.__name__
+        # D-Bus errors lead with a bracketed name; that is the useful key.
+        name = detail.split("]")[0].lstrip("[") if detail.startswith("[") else ""
+        key = (exc.__class__.__name__, name)
+
+        now = time.monotonic()
+        last, suppressed = self._ble_error_log.get(key, (0.0, 0))
+        if now - last < BLE_ERROR_LOG_INTERVAL:
+            self._ble_error_log[key] = (last, suppressed + 1)
+            return
+
+        self._ble_error_log[key] = (now, 0)
+        repeat = (
+            " (%d more since the last report)" % suppressed if suppressed else ""
+        )
+        logger.warning(
+            "BLE error for %s: %s: %s%s — retrying in %.0fs",
+            self.address, exc.__class__.__name__, detail, repeat, delay,
+        )
 
     async def _resolve_device(self) -> BLEDevice | None:
         """Resolve a BLEDevice for our address: BlueZ cache first, then scan.
