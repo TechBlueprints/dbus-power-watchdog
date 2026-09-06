@@ -330,3 +330,206 @@ class TestScanAdapterForWithMacs:
         stub_claims({"00:1A:7D:DA:71:07": "hci2", "68:4E:05:44:77:B0": "hci0"})
         entries = ["68:4E:05:44:77:B0", "AA:BB@00:1A:7D:DA:71:07"]
         assert scan_adapter_for("AA:BB", entries) == "hci2"
+
+
+# ── Shared-install discovery (2026-09-06) ─────────────────────────────────
+#
+# The service finds /data/bcm itself (ble_stack.py, lifted verbatim from the
+# fleet reference) instead of being launched through an interpreter shim.
+# Nothing about how the process was launched may decide which stack it runs
+# on, and the connection manager must be importable before bleak whether or
+# not the catcher is enabled.
+
+import ble_stack  # noqa: E402
+import power_watchdog_ble_manager as manager  # noqa: E402
+
+
+@pytest.fixture
+def clean_import_state():
+    """Restore sys.path and drop any module a test imported from tmp."""
+    path_before = list(sys.path)
+    modules_before = set(sys.modules)
+    ble_stack.shared_failure = None
+    yield
+    sys.path[:] = path_before
+    for name in set(sys.modules) - modules_before:
+        del sys.modules[name]
+    sys.modules.pop("bleak_connection_manager", None)
+    ble_stack.shared_failure = None
+
+
+def _fake_shared_install(root, body="MARK = 'shared'\n"):
+    pkg = root / "src" / "bleak_connection_manager"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text(body)
+    return str(root)
+
+
+class TestEnsureBleStack:
+    def test_shared_install_goes_to_the_front_of_sys_path(
+        self, tmp_path, clean_import_state,
+    ):
+        root = _fake_shared_install(tmp_path)
+        assert ble_stack.ensure_ble_stack(root, vendored_dir=None) == "shared"
+        # src first, then ext, then the two upstream trees -- import
+        # priority order, ahead of everything the interpreter had.
+        assert sys.path[:4] == ble_stack.shared_lib_paths(root)
+        import bleak_connection_manager
+
+        assert bleak_connection_manager.MARK == "shared"
+        assert ble_stack.shared_failure is None
+
+    def test_absent_install_inserts_nothing(self, tmp_path, clean_import_state):
+        before = list(sys.path)
+        result = ble_stack.ensure_ble_stack(
+            str(tmp_path / "nope"), vendored_dir=None,
+        )
+        assert result == "vendored"
+        assert sys.path == before
+        assert ble_stack.shared_failure is None
+        assert "bleak_connection_manager" not in sys.modules
+
+    def test_broken_install_is_withdrawn_entirely(
+        self, tmp_path, clean_import_state,
+    ):
+        # Present but unusable must not leave half a stack on the path: a
+        # bleak from /data/bcm with no catcher would be a silent downgrade.
+        root = _fake_shared_install(
+            tmp_path, body="raise RuntimeError('half-installed')\n",
+        )
+        before = list(sys.path)
+        assert ble_stack.ensure_ble_stack(root, vendored_dir=None) == "vendored"
+        assert sys.path == before
+        assert "RuntimeError" in ble_stack.shared_failure
+        assert "half-installed" in ble_stack.shared_failure
+        assert not any(
+            (getattr(m, "__file__", None) or "").startswith(root)
+            for m in sys.modules.values()
+        )
+
+    def test_already_imported_manager_is_left_alone(
+        self, tmp_path, clean_import_state, monkeypatch,
+    ):
+        # A launcher or a test stub that already provided the package wins;
+        # the shared dir is not even looked at.
+        root = _fake_shared_install(tmp_path)
+        monkeypatch.setitem(
+            sys.modules, "bleak_connection_manager",
+            types.ModuleType("bleak_connection_manager"),
+        )
+        before = list(sys.path)
+        assert ble_stack.ensure_ble_stack(root, vendored_dir=None) == "provided"
+        assert sys.path == before
+
+    def test_manager_is_importable_before_bleak(
+        self, tmp_path, clean_import_state,
+    ):
+        # The contract: import the connection manager FIRST, so a box-wide
+        # autowire hook stands down for this process.  ensure_ble_stack
+        # itself performs that import.
+        root = _fake_shared_install(tmp_path)
+        ble_stack.ensure_ble_stack(root, vendored_dir=None)
+        assert "bleak_connection_manager" in sys.modules
+
+
+@pytest.fixture
+def spy_ensure(monkeypatch):
+    """Replace ble_stack.ensure_ble_stack with a recorder."""
+    calls = []
+
+    def _ensure(shared_dir, vendored_dir=ble_stack.EXT_BLE):
+        calls.append((shared_dir, vendored_dir))
+        return "provided"
+
+    monkeypatch.setattr(ble_stack, "ensure_ble_stack", _ensure)
+    return calls
+
+
+class TestInstallFindsTheStack:
+    def test_default_shared_dir(self, spy_ensure, stub_library):
+        stub_library()
+        install_ble_connection_manager(settings={})
+        assert spy_ensure == [(manager.DEFAULT_SHARED_DIR, None)]
+        assert manager.DEFAULT_SHARED_DIR == "/data/bcm"
+
+    def test_shared_dir_comes_from_config(self, spy_ensure, stub_library):
+        stub_library()
+        install_ble_connection_manager(
+            settings={"ble_connection_manager_dir": " /data/bcm-canary "},
+        )
+        assert spy_ensure == [("/data/bcm-canary", None)]
+
+    def test_blank_setting_means_default(self, spy_ensure, stub_library):
+        stub_library()
+        install_ble_connection_manager(
+            settings={"ble_connection_manager_dir": ""},
+        )
+        assert spy_ensure == [(manager.DEFAULT_SHARED_DIR, None)]
+
+    def test_no_vendored_fallback_is_ever_offered(self, spy_ensure, stub_library):
+        # This repo vendors nothing; offering ext/ would be a stale-copy trap.
+        stub_library()
+        install_ble_connection_manager(settings={})
+        assert spy_ensure[0][1] is None
+
+    def test_stack_is_found_even_when_the_catcher_is_disabled(
+        self, spy_ensure, stub_library,
+    ):
+        # Importability is not a feature flag: power_watchdog_ble still
+        # needs bleak, and the shared install is the only place it lives.
+        stub = stub_library()
+        install_ble_connection_manager(
+            settings={"ble_connection_manager": "false"},
+        )
+        assert len(spy_ensure) == 1
+        assert stub.calls == []
+
+    def test_start_notify_policy_is_stated_in_process(
+        self, spy_ensure, stub_library,
+    ):
+        # Fleet policy used to arrive via the shim's environment; with a
+        # plain launcher it has to be said here, per consumer.
+        stub = stub_library()
+        install_ble_connection_manager(settings={})
+        assert stub.calls[0][1]["force_start_notify"] is True
+
+    def test_loaded_from_is_logged(self, spy_ensure, stub_library, caplog):
+        stub_library()
+        with caplog.at_level("INFO", logger="power_watchdog_ble_manager"):
+            install_ble_connection_manager(settings={})
+        assert any(
+            "BLE coordination: bleak_connection_manager loaded from" in r.message
+            for r in caplog.records
+        )
+
+
+class TestInstallWithoutTheStack:
+    def test_absent_install_is_a_warning(self, monkeypatch, caplog):
+        # The normal state of any box without the shared install.
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager", None)
+        monkeypatch.setattr(ble_stack, "shared_failure", None)
+        with caplog.at_level("WARNING", logger="power_watchdog_ble_manager"):
+            assert install_ble_connection_manager(
+                settings={"ble_connection_manager_dir": "/data/bcm"},
+            ) is False
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "no shared install at /data/bcm" in warnings[0].message
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+    def test_broken_install_is_an_error(
+        self, tmp_path, clean_import_state, caplog,
+    ):
+        # Present but unusable is an operator action, not background noise.
+        # A real half-installed tree, so the loader itself records why.
+        root = _fake_shared_install(
+            tmp_path, body="raise RuntimeError('half-installed')\n",
+        )
+        with caplog.at_level("WARNING", logger="power_watchdog_ble_manager"):
+            assert install_ble_connection_manager(
+                settings={"ble_connection_manager_dir": root},
+            ) is False
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1
+        assert "present but unusable" in errors[0].message
+        assert "half-installed" in errors[0].message

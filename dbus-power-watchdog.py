@@ -49,10 +49,10 @@ from gi.repository import GLib
 from dbus.mainloop.glib import DBusGMainLoop
 
 # velib_python is service-specific and stays vendored here; the BLE stack
-# does not. In production it comes from the shared /data/bcm checkout via
-# the interpreter shim in service/run, and from ext/ only as a standalone
-# fallback — resolved lazily by power_watchdog_ble_manager._ensure_ble_stack
-# so the entry points need no path knowledge of their own.
+# does not. It comes from the shared /data/bcm checkout, which
+# install_ble_connection_manager puts on sys.path (ble_stack.py) before
+# anything imports bleak — so the entry points need no path knowledge of
+# their own, and nothing about how they were launched decides the stack.
 _ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ext")
 sys.path.insert(1, os.path.join(_ext_dir, "velib_python"))
 

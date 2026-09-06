@@ -19,8 +19,8 @@ if [ ! -f "$INSTALL_DIR/ext/velib_python/vedbus.py" ]; then
     echo "WARNING: Missing dependency ext/velib_python/vedbus.py"
     cd "$INSTALL_DIR" && git submodule update --init ext/velib_python 2>/dev/null || true
 fi
-if [ ! -x /data/bcm/python3 ]; then
-    echo "WARNING: shared BLE stack missing (/data/bcm/python3); run install.sh"
+if [ ! -d /data/bcm/src/bleak_connection_manager ]; then
+    echo "WARNING: shared BLE stack missing (/data/bcm); run install.sh"
 fi
 
 # Create rc.local if it doesn't exist

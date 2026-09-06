@@ -117,7 +117,8 @@ echo ""
 # This repo vendors NO part of the BLE stack -- this is where all of it
 # comes from. One checkout under /data/bcm serves bleak, bleak-retry-connector
 # and bleak-connection-manager to every BLE service on the box, and
-# service/run execs through its interpreter shim, so nothing here can pin the
+# the service puts that checkout on sys.path itself (ble_stack.py), so nothing
+# here can pin the
 # fleet to a private version (and the tests cannot drift onto a different
 # bleak than production runs). Without it the service has no bleak at all,
 # so a failure here is fatal rather than a degradation.
@@ -141,8 +142,8 @@ fi
 
 if [ "$BCM_OK" = true ]; then
     # Unpiped on purpose: piping through tail/tee eats the exit code, and a
-    # failed smoke import must surface as an installer failure -- install.sh
-    # leaves the old shim in place and prints the rollback command.
+    # failed smoke import must surface as an installer failure -- the library's
+    # install.sh does not advance on one, and prints the rollback command.
     "$BCM_DIR/install.sh"
     if [ $? -ne 0 ]; then
         BCM_OK=false

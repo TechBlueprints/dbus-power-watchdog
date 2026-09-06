@@ -114,10 +114,12 @@ adapter-bound, claiming scanner instead.
 The **entire BLE stack comes from the shared install at `/data/bcm`** — one
 bleak-connection-manager checkout serving every BLE service on the GX.
 `install.sh` converges that checkout (clone, or fetch + `--ff-only`) and runs
-its installer; `service/run` then execs through its interpreter shim
-(`/data/bcm/python3`), which puts bleak, bleak-retry-connector and
-bleak-connection-manager on `PYTHONPATH`.  This is what keeps every BLE
-service on the box speaking one version of the claims convention.
+its installer; the service then puts that checkout on its own `sys.path` at
+start (`ble_stack.py`, a verbatim copy of the fleet's reference consumer
+contract) and imports the connection manager before bleak.  Nothing about
+how it was launched decides the stack: `service/run` is plain `python3`.
+This is what keeps every BLE service on the box speaking one version of the
+claims convention.
 
 **This repo vendors no part of that stack, and pins no version of it.**  A
 private pin is how one service drifts onto a different convention than the

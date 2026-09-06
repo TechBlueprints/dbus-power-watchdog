@@ -26,13 +26,21 @@ Everything here is stdlib only.  The parsing helpers are shared with
 adapter its scans run on (the catcher routes connections, not our scans —
 see ``ble_wrap_scanner``).
 
-Nothing here puts the BLE stack on ``sys.path``: this repo vendors none of
-it.  bleak, bleak-retry-connector and the catcher come from the shared
-``/data/bcm`` checkout that ``install.sh`` converges and whose interpreter
-shim ``service/run`` execs through.  A private pin is exactly how one
-service drifts onto a different version of the claims convention than the
-rest of the fleet — and it also meant the tests ran a different bleak major
-than production did.
+This repo vendors no part of the BLE stack.  bleak, bleak-retry-connector
+and the catcher come from the shared ``/data/bcm`` checkout that
+``install.sh`` converges, and :func:`install_ble_connection_manager` puts
+that checkout on ``sys.path`` itself, through ``ble_stack.py`` — a verbatim
+copy of the fleet's reference implementation of the consumer contract
+(dbus-serialbattery's ``ble_stack.py``; see the library's
+CONSUMER_MIGRATION.md).  Nothing about how the process was launched decides
+which stack it runs on: no interpreter shim, no PYTHONPATH, no environment
+contract.  The connection manager is imported before bleak, which is what
+makes the box-wide autowire hook stand down for this process instead of
+installing a generic catcher with a cmdline-derived owner.
+
+A private pin is exactly how one service drifts onto a different version
+of the claims convention than the rest of the fleet — and it also meant the
+tests ran a different bleak major than production did.
 """
 
 from __future__ import annotations
@@ -41,7 +49,12 @@ import configparser
 import logging
 import os
 
+import ble_stack
+
 logger = logging.getLogger(__name__)
+
+# Where the shared install lives unless config says otherwise.
+DEFAULT_SHARED_DIR = ble_stack.DEFAULT_SHARED_DIR
 
 # Established-link capacity is deployment config, not discovery: dongle
 # limits are undocumented.  An adapter with no cap is never slot-gated.
@@ -228,10 +241,24 @@ def install_ble_connection_manager(
     the catcher's routing and our own scan adapter choice.
 
     A failed install is logged and swallowed: the catcher is coordination,
-    and connecting uncoordinated beats not connecting at all.
+    and connecting uncoordinated beats not connecting at all.  A shared
+    install that is *present but broken* is an ERROR (an operator action);
+    one that is simply absent is a WARNING (the normal state of any box
+    without it).
     """
     if settings is None:
         settings = load_ble_settings()
+
+    shared_dir = (
+        (settings.get("ble_connection_manager_dir") or "").strip()
+        or DEFAULT_SHARED_DIR
+    )
+    # Unconditionally, and before the enable check: importability is not a
+    # feature flag.  power_watchdog_ble does `from bleak import ...` at
+    # module scope and this repo vendors no bleak, so the shared install is
+    # the only place it can come from whether or not the catcher is wanted.
+    # No vendored fallback: absent means whatever bleak the interpreter has.
+    ble_stack.ensure_ble_stack(shared_dir, vendored_dir=None)
 
     if not parse_bool(settings.get("ble_connection_manager"), default=True):
         logger.info("BLE connection manager disabled by config")
@@ -243,12 +270,32 @@ def install_ble_connection_manager(
 
     try:
         from bleak_connection_manager import install_bleak_catcher
+    except ImportError:
+        if ble_stack.shared_failure:
+            logger.error(
+                "BLE coordination: shared install at %s is present but "
+                "unusable, running uncoordinated: %s",
+                shared_dir, ble_stack.shared_failure,
+            )
+        else:
+            logger.warning(
+                "BLE coordination: no shared install at %s; running "
+                "uncoordinated, no claims, no adapter routing, no card "
+                "recovery",
+                shared_dir,
+            )
+        return False
 
+    try:
         install_bleak_catcher(
             owner,
             adapters=adapters,
             link_caps=link_caps,
             wrap_scanner=wrap_scanner,
+            # Fleet policy: BlueZ StartNotify, never AcquireNotify (the
+            # BlueZ 5.72 notify_io double-free).  Stated here, per consumer,
+            # now that no launcher environment decides it for us.
+            force_start_notify=True,
         )
     except Exception:
         logger.exception(
@@ -257,6 +304,12 @@ def install_ble_connection_manager(
         )
         return False
 
+    import bleak_connection_manager as _bcm
+
+    logger.info(
+        "BLE coordination: bleak_connection_manager loaded from %s",
+        os.path.dirname(getattr(_bcm, "__file__", None) or "?"),
+    )
     logger.info(
         "BLE connection manager installed (adapters=%s, link_caps=%s, "
         "wrap_scanner=%s)",

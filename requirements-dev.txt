@@ -1,14 +1,14 @@
 # Test-only dependencies.
 #
 # These are NOT vendored and NOT installed on a GX: in production the BLE
-# stack comes from the shared /data/bcm checkout via the interpreter shim
-# (see install.sh and service/run). They are pinned to the versions that
+# stack comes from the shared /data/bcm checkout, which the service puts on
+# its own sys.path (see ble_stack.py). They are pinned to the versions that
 # shared checkout serves, so the suite cannot quietly test a different bleak
 # than production runs — which is exactly what happened while this repo
 # vendored bleak 2.1.1 against a fleet running 3.0.2.
 #
 # Check the fleet's versions with:
-#   ssh <gx> '/data/bcm/python3 -c "import bleak; print(bleak.__file__)"'
+#   ssh <gx> 'git -C /data/bcm submodule status'
 #
 # bleak-connection-manager itself is deliberately absent: the tests stub it,
 # and its absence exercises the documented "connect uncoordinated" path.
