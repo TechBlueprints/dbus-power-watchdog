@@ -390,11 +390,17 @@ def install_ble_connection_manager(
 
     try:
         install_bleak_catcher(owner, **kwargs)
-    except Exception:
-        logger.exception(
-            "Failed to install the BLE connection manager, "
-            "continuing without it",
+    except Exception as exc:
+        # Sixth contract line.  The import succeeded, so the install is
+        # fine; a bad kwarg, a raising validator or a catcher bug is the
+        # driver's or the library's to fix -- distinct from "present but
+        # unusable" because the operator action is different.
+        logger.error(
+            "BLE coordination: catcher would not install from %s, "
+            "running uncoordinated: %s",
+            shared_dir or "(provided)", repr(exc),
         )
+        logger.debug("install_bleak_catcher traceback", exc_info=True)
         return False
 
     logger.info(

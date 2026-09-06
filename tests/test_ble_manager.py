@@ -205,11 +205,18 @@ class TestInstall:
         install_ble_connection_manager(settings={})
         assert stub.calls[0][1]["wrap_scanner"] is False
 
-    def test_failure_is_swallowed(self, stub_library):
+    def test_failure_is_swallowed(self, stub_library, caplog):
         # Coordination is an optimization: connecting uncoordinated beats
-        # not connecting at all.
+        # not connecting at all.  Sixth contract line, verbatim: the import
+        # worked, so this is the driver's or catcher's fault, not the
+        # install's.
         stub_library(raises=RuntimeError("no claim dir"))
-        assert install_ble_connection_manager(settings={}) is False
+        with caplog.at_level("ERROR", logger="power_watchdog_ble_manager"):
+            assert install_ble_connection_manager(settings={}) is False
+        assert [r.message for r in caplog.records] == [
+            "BLE coordination: catcher would not install from /data/bcm, "
+            "running uncoordinated: RuntimeError('no claim dir')"
+        ]
 
     def test_missing_library_is_swallowed(self, monkeypatch):
         monkeypatch.setitem(sys.modules, "bleak_connection_manager", None)
