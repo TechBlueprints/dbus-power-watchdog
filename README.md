@@ -119,7 +119,9 @@ start (`ble_stack.py`, a verbatim copy of the fleet's reference consumer
 contract) and imports the connection manager before bleak.  Nothing about
 how it was launched decides the stack: `service/run` is plain `python3`.
 This is what keeps every BLE service on the box speaking one version of the
-claims convention.
+claims convention.  Two config keys govern it, `ble_connection_manager_dir`
+(where the install is; empty means never look) and `ble_force_start_notify`
+(the fleet's BlueZ StartNotify policy, stated per consumer).
 
 **This repo vendors no part of that stack, and pins no version of it.**  A
 private pin is how one service drifts onto a different convention than the

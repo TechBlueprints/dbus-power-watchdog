@@ -307,9 +307,15 @@ class TestResolveAdapter:
         resolve_adapter("00:1A:7D:DA:71:07")
         assert calls == [("00:1A:7D:DA:71:07", True)]
 
-    def test_no_shared_stack_uses_the_entry_verbatim(self, monkeypatch):
+    def test_no_shared_stack_uses_an_hci_name_verbatim(self, monkeypatch):
         monkeypatch.setitem(sys.modules, "bleak_connection_manager", None)
         assert resolve_adapter("hci2") == "hci2"
+
+    def test_no_shared_stack_drops_a_mac(self, monkeypatch):
+        # Contract rule 7: on the standalone path hand plain bleak nothing
+        # it cannot parse.  A MAC is the library's syntax, not bleak's.
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager", None)
+        assert resolve_adapter("00:1A:7D:DA:71:07") is None
 
     def test_empty_entry(self):
         assert resolve_adapter(None) is None
@@ -434,22 +440,28 @@ class TestEnsureBleStack:
 
 @pytest.fixture
 def spy_ensure(monkeypatch):
-    """Replace ble_stack.ensure_ble_stack with a recorder."""
+    """Replace ble_stack.ensure_ble_stack with a recorder.
+
+    Answers "provided" (the test-stub state) unless the test sets
+    ``spy_ensure.mode`` first.
+    """
     calls = []
 
     def _ensure(shared_dir, vendored_dir=ble_stack.EXT_BLE):
         calls.append((shared_dir, vendored_dir))
-        return "provided"
+        return _ensure.mode
 
+    _ensure.mode = "provided"
+    _ensure.calls = calls
     monkeypatch.setattr(ble_stack, "ensure_ble_stack", _ensure)
-    return calls
+    return _ensure
 
 
 class TestInstallFindsTheStack:
     def test_default_shared_dir(self, spy_ensure, stub_library):
         stub_library()
         install_ble_connection_manager(settings={})
-        assert spy_ensure == [(manager.DEFAULT_SHARED_DIR, None)]
+        assert spy_ensure.calls == [(manager.DEFAULT_SHARED_DIR, None)]
         assert manager.DEFAULT_SHARED_DIR == "/data/bcm"
 
     def test_shared_dir_comes_from_config(self, spy_ensure, stub_library):
@@ -457,20 +469,24 @@ class TestInstallFindsTheStack:
         install_ble_connection_manager(
             settings={"ble_connection_manager_dir": " /data/bcm-canary "},
         )
-        assert spy_ensure == [("/data/bcm-canary", None)]
+        assert spy_ensure.calls == [("/data/bcm-canary", None)]
 
-    def test_blank_setting_means_default(self, spy_ensure, stub_library):
-        stub_library()
+    def test_empty_setting_means_never_look(self, spy_ensure, stub_library):
+        # Contract rule 1: an EMPTY value is a deliberate standalone run,
+        # not a request for the default.
+        stub = stub_library()
         install_ble_connection_manager(
             settings={"ble_connection_manager_dir": ""},
         )
-        assert spy_ensure == [(manager.DEFAULT_SHARED_DIR, None)]
+        assert spy_ensure.calls == []
+        # ...and the catcher is still installed if something provides it.
+        assert len(stub.calls) == 1
 
     def test_no_vendored_fallback_is_ever_offered(self, spy_ensure, stub_library):
         # This repo vendors nothing; offering ext/ would be a stale-copy trap.
         stub_library()
         install_ble_connection_manager(settings={})
-        assert spy_ensure[0][1] is None
+        assert spy_ensure.calls[0][1] is None
 
     def test_stack_is_found_even_when_the_catcher_is_disabled(
         self, spy_ensure, stub_library,
@@ -481,41 +497,84 @@ class TestInstallFindsTheStack:
         install_ble_connection_manager(
             settings={"ble_connection_manager": "false"},
         )
-        assert len(spy_ensure) == 1
+        assert len(spy_ensure.calls) == 1
         assert stub.calls == []
 
-    def test_start_notify_policy_is_stated_in_process(
-        self, spy_ensure, stub_library,
-    ):
+    def test_start_notify_policy_defaults_on(self, spy_ensure, stub_library):
         # Fleet policy used to arrive via the shim's environment; with a
-        # plain launcher it has to be said here, per consumer.
+        # plain launcher it is a consumer-side key, default true.
         stub = stub_library()
         install_ble_connection_manager(settings={})
         assert stub.calls[0][1]["force_start_notify"] is True
 
-    def test_loaded_from_is_logged(self, spy_ensure, stub_library, caplog):
+    def test_start_notify_policy_can_be_switched_off(
+        self, spy_ensure, stub_library,
+    ):
+        stub = stub_library()
+        install_ble_connection_manager(
+            settings={"ble_force_start_notify": "false"},
+        )
+        assert stub.calls[0][1]["force_start_notify"] is False
+
+    def test_loaded_from_is_logged_for_a_shared_install(
+        self, spy_ensure, stub_library, caplog,
+    ):
+        stub_library()
+        sys.modules["bleak_connection_manager"].__file__ = (
+            "/data/bcm/src/bleak_connection_manager/__init__.py"
+        )
+        spy_ensure.mode = "shared"
+        with caplog.at_level("INFO", logger="power_watchdog_ble_manager"):
+            install_ble_connection_manager(settings={})
+        infos = [r.message for r in caplog.records if r.levelname == "INFO"]
+        assert (
+            "BLE coordination: bleak_connection_manager loaded from "
+            "/data/bcm/src/bleak_connection_manager"
+        ) in infos
+
+    def test_provided_install_logs_nothing_about_loading(
+        self, spy_ensure, stub_library, caplog,
+    ):
+        # "provided" inserts nothing, so there is nothing to report.
         stub_library()
         with caplog.at_level("INFO", logger="power_watchdog_ble_manager"):
             install_ble_connection_manager(settings={})
-        assert any(
-            "BLE coordination: bleak_connection_manager loaded from" in r.message
-            for r in caplog.records
-        )
+        assert not any("BLE coordination" in r.message for r in caplog.records)
 
 
 class TestInstallWithoutTheStack:
-    def test_absent_install_is_a_warning(self, monkeypatch, caplog):
+    def test_absent_install_is_a_warning(
+        self, tmp_path, clean_import_state, caplog,
+    ):
         # The normal state of any box without the shared install.
-        monkeypatch.setitem(sys.modules, "bleak_connection_manager", None)
-        monkeypatch.setattr(ble_stack, "shared_failure", None)
+        missing = str(tmp_path / "nope")
         with caplog.at_level("WARNING", logger="power_watchdog_ble_manager"):
             assert install_ble_connection_manager(
-                settings={"ble_connection_manager_dir": "/data/bcm"},
+                settings={"ble_connection_manager_dir": missing},
             ) is False
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
-        assert "no shared install at /data/bcm" in warnings[0].message
-        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+        contract = [
+            r for r in caplog.records if r.message.startswith("BLE coordination")
+        ]
+        assert [r.levelname for r in contract] == ["WARNING"]
+        # Verbatim: the fleet monitor greps for this string.
+        assert contract[0].message == (
+            "BLE coordination: no shared install at %s" % missing
+        )
+
+    def test_absent_install_still_warns_when_the_catcher_is_disabled(
+        self, tmp_path, clean_import_state, caplog,
+    ):
+        # Logging follows the stack state, not the enable flag.
+        missing = str(tmp_path / "nope")
+        with caplog.at_level("WARNING", logger="power_watchdog_ble_manager"):
+            install_ble_connection_manager(settings={
+                "ble_connection_manager_dir": missing,
+                "ble_connection_manager": "false",
+            })
+        assert any(
+            r.message == "BLE coordination: no shared install at %s" % missing
+            for r in caplog.records
+        )
 
     def test_broken_install_is_an_error(
         self, tmp_path, clean_import_state, caplog,
@@ -531,5 +590,10 @@ class TestInstallWithoutTheStack:
             ) is False
         errors = [r for r in caplog.records if r.levelname == "ERROR"]
         assert len(errors) == 1
-        assert "present but unusable" in errors[0].message
-        assert "half-installed" in errors[0].message
+        # Verbatim shape: "... at <dir> is present but unusable: <why>".
+        assert errors[0].message.startswith(
+            "BLE coordination: shared install at %s is present but unusable: "
+            % root
+        )
+        assert "RuntimeError('half-installed')" in errors[0].message
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]

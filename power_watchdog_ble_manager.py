@@ -48,6 +48,7 @@ from __future__ import annotations
 import configparser
 import logging
 import os
+import re
 
 import ble_stack
 
@@ -63,6 +64,9 @@ DEFAULT_LINK_CAPS = ""
 # Claim owner recorded in /run/bt-claims for the main service.  The library
 # appends this process's pid, so restarts never collide.
 CLAIM_OWNER = "dbus-power-watchdog"
+
+# The only adapter spelling plain bleak understands.
+_HCI_NAME = re.compile(r"^hci\d+$")
 
 
 def parse_bool(raw: str | None, default: bool = False) -> bool:
@@ -164,8 +168,17 @@ def resolve_adapter(entry: str | None) -> str | None:
     try:
         from bleak_connection_manager import claims
     except Exception:
-        # No shared stack: the entry can only be used as written.
-        return entry
+        # No shared stack (a standalone run): touch nothing of the
+        # library's, and hand plain bleak only what it understands.  A MAC
+        # is the library's adapter syntax; bleak's adapter= wants hciN.
+        if _HCI_NAME.match(entry):
+            return entry
+        logger.warning(
+            "Adapter '%s' needs the shared BLE stack to resolve; "
+            "letting bleak choose",
+            entry,
+        )
+        return None
 
     try:
         resolved = claims.hci_for(entry)
@@ -229,6 +242,33 @@ def load_ble_settings(config_dir: str | None = None) -> dict[str, str]:
     return dict(config["DEFAULT"]) if "DEFAULT" in config else {}
 
 
+def _log_stack_state(mode: str, shared_dir: str) -> None:
+    """One line per outcome, in the contract's words.
+
+    The fleet monitor greps for these three strings, so the wording is not
+    ours to improve.  "No shared install" and "shared install unusable"
+    are different operator actions and must never log alike.
+    """
+    if mode == "shared":
+        import bleak_connection_manager as _bcm
+
+        logger.info(
+            "BLE coordination: bleak_connection_manager loaded from %s",
+            os.path.dirname(getattr(_bcm, "__file__", None) or shared_dir),
+        )
+    elif mode == "vendored":
+        if ble_stack.shared_failure:
+            logger.error(
+                "BLE coordination: shared install at %s is present but "
+                "unusable: %s",
+                shared_dir, ble_stack.shared_failure,
+            )
+        else:
+            logger.warning(
+                "BLE coordination: no shared install at %s", shared_dir,
+            )
+
+
 def install_ble_connection_manager(
     owner: str = CLAIM_OWNER,
     settings: dict[str, str] | None = None,
@@ -249,41 +289,50 @@ def install_ble_connection_manager(
     if settings is None:
         settings = load_ble_settings()
 
-    shared_dir = (
-        (settings.get("ble_connection_manager_dir") or "").strip()
-        or DEFAULT_SHARED_DIR
-    )
+    shared_dir = settings.get("ble_connection_manager_dir")
+    if shared_dir is None:
+        shared_dir = DEFAULT_SHARED_DIR
+    shared_dir = shared_dir.strip()
     # Unconditionally, and before the enable check: importability is not a
     # feature flag.  power_watchdog_ble does `from bleak import ...` at
     # module scope and this repo vendors no bleak, so the shared install is
     # the only place it can come from whether or not the catcher is wanted.
     # No vendored fallback: absent means whatever bleak the interpreter has.
-    ble_stack.ensure_ble_stack(shared_dir, vendored_dir=None)
+    # An EMPTY key means never look -- a deliberate standalone run.
+    if shared_dir:
+        mode = ble_stack.ensure_ble_stack(shared_dir, vendored_dir=None)
+        _log_stack_state(mode, shared_dir)
+    else:
+        mode = "provided"  # whatever the interpreter has; never looked
+        logger.info(
+            "BLE coordination: shared install lookup disabled by config "
+            "(ble_connection_manager_dir is empty)",
+        )
 
     if not parse_bool(settings.get("ble_connection_manager"), default=True):
         logger.info("BLE connection manager disabled by config")
+        return False
+    if mode == "vendored":
+        # Contract rule 7: on the standalone path touch nothing of the
+        # library's.  The state was logged above; nothing more to say.
         return False
 
     adapters = parse_adapters(settings.get("bluetooth_adapters"))
     link_caps = parse_link_caps(settings.get("ble_link_caps", DEFAULT_LINK_CAPS))
     wrap_scanner = parse_bool(settings.get("ble_wrap_scanner"), default=False)
+    # Fleet policy: BlueZ StartNotify, never AcquireNotify (the BlueZ 5.72
+    # notify_io double-free).  A consumer-side key on the same footing as
+    # the location, now that no launcher environment decides it for us.
+    force_start_notify = parse_bool(
+        settings.get("ble_force_start_notify"), default=True,
+    )
 
     try:
         from bleak_connection_manager import install_bleak_catcher
     except ImportError:
-        if ble_stack.shared_failure:
-            logger.error(
-                "BLE coordination: shared install at %s is present but "
-                "unusable, running uncoordinated: %s",
-                shared_dir, ble_stack.shared_failure,
-            )
-        else:
-            logger.warning(
-                "BLE coordination: no shared install at %s; running "
-                "uncoordinated, no claims, no adapter routing, no card "
-                "recovery",
-                shared_dir,
-            )
+        logger.warning(
+            "BLE connection manager is not importable; running uncoordinated",
+        )
         return False
 
     try:
@@ -292,10 +341,7 @@ def install_ble_connection_manager(
             adapters=adapters,
             link_caps=link_caps,
             wrap_scanner=wrap_scanner,
-            # Fleet policy: BlueZ StartNotify, never AcquireNotify (the
-            # BlueZ 5.72 notify_io double-free).  Stated here, per consumer,
-            # now that no launcher environment decides it for us.
-            force_start_notify=True,
+            force_start_notify=force_start_notify,
         )
     except Exception:
         logger.exception(
@@ -304,18 +350,13 @@ def install_ble_connection_manager(
         )
         return False
 
-    import bleak_connection_manager as _bcm
-
-    logger.info(
-        "BLE coordination: bleak_connection_manager loaded from %s",
-        os.path.dirname(getattr(_bcm, "__file__", None) or "?"),
-    )
     logger.info(
         "BLE connection manager installed (adapters=%s, link_caps=%s, "
-        "wrap_scanner=%s)",
+        "wrap_scanner=%s, force_start_notify=%s)",
         ", ".join(adapters) if adapters else "all present",
         ", ".join("%s:%d" % kv for kv in sorted(link_caps.items()))
         if link_caps else "uncapped",
         wrap_scanner,
+        force_start_notify,
     )
     return True
