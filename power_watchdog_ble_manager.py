@@ -32,7 +32,7 @@ and the catcher come from the shared ``/data/bcm`` checkout that
 that checkout on ``sys.path`` itself, through ``ble_stack.py`` — a verbatim
 copy of the fleet's reference implementation of the consumer contract
 (dbus-serialbattery's ``ble_stack.py``; see the library's
-CONSUMER_MIGRATION.md).  Nothing about how the process was launched decides
+CONSUMERS.md).  Nothing about how the process was launched decides
 which stack it runs on: no interpreter shim, no PYTHONPATH, no environment
 contract.  The connection manager is imported before bleak, which is what
 makes the box-wide autowire hook stand down for this process instead of
