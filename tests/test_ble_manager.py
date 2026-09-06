@@ -346,6 +346,8 @@ class TestScanAdapterForWithMacs:
 # on, and the connection manager must be importable before bleak whether or
 # not the catcher is enabled.
 
+import os  # noqa: E402
+
 import ble_stack  # noqa: E402
 import power_watchdog_ble_manager as manager  # noqa: E402
 
@@ -536,6 +538,46 @@ class TestInstallFindsTheStack:
             settings={"ble_force_start_notify": "false"},
         )
         assert stub.calls[0][1]["force_start_notify"] is False
+
+    def test_legacy_install_gets_the_policy_through_the_environment(
+        self, spy_ensure, monkeypatch, caplog,
+    ):
+        # Fifth contract line: a shared install older than 159536a has no
+        # force_start_notify= parameter.  Detect it from the signature,
+        # set the legacy variable, and warn -- the monitor treats this as
+        # a raise whose operator action is "update the install".
+        calls = []
+
+        def legacy_install(owner, adapters=(), link_caps=None,
+                           wrap_scanner=False):
+            calls.append((owner, adapters, link_caps, wrap_scanner))
+
+        module = types.ModuleType("bleak_connection_manager")
+        module.install_bleak_catcher = legacy_install
+        monkeypatch.setitem(sys.modules, "bleak_connection_manager", module)
+        monkeypatch.delenv("BCM_FORCE_START_NOTIFY", raising=False)
+        with caplog.at_level("WARNING", logger="power_watchdog_ble_manager"):
+            assert install_ble_connection_manager(
+                settings={"ble_force_start_notify": "false"},
+            ) is True
+        assert len(calls) == 1
+        assert os.environ["BCM_FORCE_START_NOTIFY"] == "false"
+        assert [r.message for r in caplog.records] == [
+            "BLE coordination: shared install at /data/bcm predates the "
+            "force_start_notify parameter; StartNotify policy passed through "
+            "the legacy BCM_FORCE_START_NOTIFY environment"
+        ]
+
+    def test_current_install_does_not_touch_the_environment(
+        self, spy_ensure, stub_library, monkeypatch, caplog,
+    ):
+        # The stub takes **kwargs, which counts as accepting the parameter.
+        stub_library()
+        monkeypatch.delenv("BCM_FORCE_START_NOTIFY", raising=False)
+        with caplog.at_level("WARNING", logger="power_watchdog_ble_manager"):
+            install_ble_connection_manager(settings={})
+        assert "BCM_FORCE_START_NOTIFY" not in os.environ
+        assert not any("predates" in r.message for r in caplog.records)
 
     def test_loaded_from_is_logged_for_a_shared_install(
         self, spy_ensure, stub_library, caplog,

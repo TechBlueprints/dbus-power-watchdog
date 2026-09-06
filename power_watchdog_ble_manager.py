@@ -46,6 +46,7 @@ tests ran a different bleak major than production did.
 from __future__ import annotations
 
 import configparser
+import inspect
 import logging
 import os
 import re
@@ -247,6 +248,22 @@ _UNCOORDINATED = (
 )
 
 
+def _accepts_force_start_notify(install) -> bool:
+    """Whether ``install_bleak_catcher`` takes ``force_start_notify=``.
+
+    A ``**kwargs`` signature counts as yes; an unreadable one is assumed
+    current, so a wrapper cannot silently push a modern install onto the
+    legacy environment path.
+    """
+    try:
+        params = inspect.signature(install).parameters
+    except (TypeError, ValueError):
+        return True
+    if "force_start_notify" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _log_stack_state(mode: str, shared_dir: str) -> None:
     """One line per outcome, in the contract's words (anchor
     ``BLE coordination: ``).
@@ -349,14 +366,30 @@ def install_ble_connection_manager(
         )
         return False
 
-    try:
-        install_bleak_catcher(
-            owner,
-            adapters=adapters,
-            link_caps=link_caps,
-            wrap_scanner=wrap_scanner,
-            force_start_notify=force_start_notify,
+    kwargs = dict(
+        adapters=adapters,
+        link_caps=link_caps,
+        wrap_scanner=wrap_scanner,
+    )
+    if _accepts_force_start_notify(install_bleak_catcher):
+        kwargs["force_start_notify"] = force_start_notify
+    else:
+        # A shared install older than 159536a (2026-09-02) has no such
+        # parameter and reads the policy from the environment instead.
+        # The contract's fifth line; the monitor treats it as a raise --
+        # the operator action is to update the install.
+        os.environ["BCM_FORCE_START_NOTIFY"] = (
+            "true" if force_start_notify else "false"
         )
+        logger.warning(
+            "BLE coordination: shared install at %s predates the "
+            "force_start_notify parameter; StartNotify policy passed "
+            "through the legacy BCM_FORCE_START_NOTIFY environment",
+            shared_dir or "(provided)",
+        )
+
+    try:
+        install_bleak_catcher(owner, **kwargs)
     except Exception:
         logger.exception(
             "Failed to install the BLE connection manager, "
