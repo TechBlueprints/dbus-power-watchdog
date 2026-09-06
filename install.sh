@@ -175,7 +175,27 @@ bash "$INSTALL_DIR/enable.sh"
 echo ""
 
 # Step 5: Start or restart service
+#
+# Pre-restart check (shared-stack consumer contract, rule 7): the launcher
+# is whatever /service/<name>/run RESOLVES to on this box -- not the copy in
+# the repo -- and a leftover exec of the retired /data/bcm/python3 shim there
+# would make the service look migrated (ensure_ble_stack answers "provided")
+# while still riding the shim.  Print its exec line; stop on shim residue.
 echo "Step 5: Starting service..."
+RUN_FILE=$(readlink -f "/service/$SERVICE_NAME/run" 2>/dev/null || echo "")
+if [ -z "$RUN_FILE" ] || [ ! -f "$RUN_FILE" ]; then
+    echo "ERROR: /service/$SERVICE_NAME/run does not resolve to a file"
+    exit 1
+fi
+echo "Launcher: $RUN_FILE"
+grep -E '^[[:space:]]*exec[[:space:]]+[^2]' "$RUN_FILE" | sed 's/^/  /'
+if grep -qE 'bcm/python3|BCM_PY|PYTHONPATH' "$RUN_FILE"; then
+    echo ""
+    echo "ERROR: $RUN_FILE still references the retired interpreter shim."
+    echo "The service finds the shared BLE stack itself (ble_stack.py); the"
+    echo "launcher must exec plain python3.  Not restarting."
+    exit 1
+fi
 if svstat "/service/$SERVICE_NAME" 2>/dev/null | grep -q ": up "; then
     if [ "$NEEDS_RESTART" = true ]; then
         echo "Restarting service to apply updates..."

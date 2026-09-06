@@ -403,13 +403,20 @@ def install_ble_connection_manager(
         logger.debug("install_bleak_catcher traceback", exc_info=True)
         return False
 
+    # Seventh contract line, once per life, right after "loaded from".
+    # The library's own install-time INFO lines never reach a consumer's
+    # log (its logger stays closed there by ruling), so this is how the
+    # install and the StartNotify policy are visible per consumer.
+    pins, _pool = split_adapters(adapters)
     logger.info(
-        "BLE connection manager installed (adapters=%s, link_caps=%s, "
-        "wrap_scanner=%s, force_start_notify=%s)",
-        ", ".join(adapters) if adapters else "all present",
+        "BLE coordination: catcher installed (force_start_notify=%s, "
+        "adapters=%d configured, %d pinned)",
+        force_start_notify, len(adapters), sum(len(v) for v in pins.values()),
+    )
+    logger.info(
+        "BLE connection manager options: link_caps=%s, wrap_scanner=%s",
         ", ".join("%s:%d" % kv for kv in sorted(link_caps.items()))
         if link_caps else "uncapped",
         wrap_scanner,
-        force_start_notify,
     )
     return True

@@ -602,14 +602,65 @@ class TestInstallFindsTheStack:
             "/data/bcm/src/bleak_connection_manager"
         ) in infos
 
+    def test_catcher_installed_line(self, spy_ensure, stub_library, caplog):
+        # Seventh contract line, verbatim: the library's own install INFO
+        # never reaches a consumer log, so the consumer says it.
+        stub_library()
+        with caplog.at_level("INFO", logger="power_watchdog_ble_manager"):
+            install_ble_connection_manager(settings={
+                "bluetooth_adapters": (
+                    "00:01:95:C9:B2:EA, "
+                    "24:EC:4A:E4:69:A5@00:01:95:C9:B2:EA, "
+                    "24:EC:4A:E4:69:A5@00:01:95:CC:33:0B"
+                ),
+            })
+        infos = [r.message for r in caplog.records if r.levelname == "INFO"]
+        assert infos[0] == (
+            "BLE coordination: catcher installed (force_start_notify=True, "
+            "adapters=3 configured, 2 pinned)"
+        )
+
+    def test_catcher_installed_line_with_policy_off_and_no_adapters(
+        self, spy_ensure, stub_library, caplog,
+    ):
+        stub_library()
+        with caplog.at_level("INFO", logger="power_watchdog_ble_manager"):
+            install_ble_connection_manager(
+                settings={"ble_force_start_notify": "no"},
+            )
+        infos = [r.message for r in caplog.records if r.levelname == "INFO"]
+        assert infos[0] == (
+            "BLE coordination: catcher installed (force_start_notify=False, "
+            "adapters=0 configured, 0 pinned)"
+        )
+
+    def test_installed_line_follows_loaded_from(
+        self, spy_ensure, stub_library, caplog,
+    ):
+        stub_library()
+        sys.modules["bleak_connection_manager"].__file__ = (
+            "/data/bcm/src/bleak_connection_manager/__init__.py"
+        )
+        spy_ensure.mode = "shared"
+        with caplog.at_level("INFO", logger="power_watchdog_ble_manager"):
+            install_ble_connection_manager(settings={})
+        contract = [
+            r.message for r in caplog.records
+            if r.message.startswith("BLE coordination: ")
+        ]
+        assert contract[0].startswith("BLE coordination: bleak_connection_manager loaded from ")
+        assert contract[1].startswith("BLE coordination: catcher installed (")
+        assert len(contract) == 2
+
     def test_provided_install_logs_nothing_about_loading(
         self, spy_ensure, stub_library, caplog,
     ):
-        # "provided" inserts nothing, so there is nothing to report.
+        # "provided" inserts nothing, so there is nothing to report about
+        # loading; the "catcher installed" line still follows.
         stub_library()
         with caplog.at_level("INFO", logger="power_watchdog_ble_manager"):
             install_ble_connection_manager(settings={})
-        assert not any("BLE coordination" in r.message for r in caplog.records)
+        assert not any("loaded from" in r.message for r in caplog.records)
 
 
 class TestInstallWithoutTheStack:
