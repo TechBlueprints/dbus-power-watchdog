@@ -471,16 +471,37 @@ class TestInstallFindsTheStack:
         )
         assert spy_ensure.calls == [("/data/bcm-canary", None)]
 
-    def test_empty_setting_means_never_look(self, spy_ensure, stub_library):
+    def test_empty_setting_means_never_look(
+        self, spy_ensure, stub_library, caplog,
+    ):
         # Contract rule 1: an EMPTY value is a deliberate standalone run,
         # not a request for the default.
         stub = stub_library()
-        install_ble_connection_manager(
-            settings={"ble_connection_manager_dir": ""},
-        )
+        with caplog.at_level("WARNING", logger="power_watchdog_ble_manager"):
+            install_ble_connection_manager(
+                settings={"ble_connection_manager_dir": ""},
+            )
         assert spy_ensure.calls == []
         # ...and the catcher is still installed if something provides it.
         assert len(stub.calls) == 1
+        # Coordination requested but nowhere to look: the contract's
+        # fourth line, verbatim.
+        assert [r.message for r in caplog.records] == [
+            "BLE coordination: ble_connection_manager is on but "
+            "ble_connection_manager_dir is empty; running uncoordinated, "
+            "no claims, no adapter routing, no card recovery"
+        ]
+
+    def test_empty_setting_with_manager_off_logs_no_line(
+        self, spy_ensure, stub_library, caplog,
+    ):
+        stub_library()
+        with caplog.at_level("INFO", logger="power_watchdog_ble_manager"):
+            install_ble_connection_manager(settings={
+                "ble_connection_manager_dir": "",
+                "ble_connection_manager": "false",
+            })
+        assert not any("BLE coordination" in r.message for r in caplog.records)
 
     def test_no_vendored_fallback_is_ever_offered(self, spy_ensure, stub_library):
         # This repo vendors nothing; offering ext/ would be a stale-copy trap.
@@ -558,23 +579,25 @@ class TestInstallWithoutTheStack:
         assert [r.levelname for r in contract] == ["WARNING"]
         # Verbatim: the fleet monitor greps for this string.
         assert contract[0].message == (
-            "BLE coordination: no shared install at %s" % missing
+            "BLE coordination: no shared install at %s; running "
+            "uncoordinated, no claims, no adapter routing, no card recovery"
+            % missing
         )
 
-    def test_absent_install_still_warns_when_the_catcher_is_disabled(
-        self, tmp_path, clean_import_state, caplog,
+    def test_manager_deliberately_off_logs_no_line(
+        self, tmp_path, clean_import_state, spy_ensure, caplog,
     ):
-        # Logging follows the stack state, not the enable flag.
+        # The stack is still made importable, silently: the coordination
+        # lines are for a manager that is on.
         missing = str(tmp_path / "nope")
-        with caplog.at_level("WARNING", logger="power_watchdog_ble_manager"):
+        spy_ensure.mode = "vendored"
+        with caplog.at_level("INFO", logger="power_watchdog_ble_manager"):
             install_ble_connection_manager(settings={
                 "ble_connection_manager_dir": missing,
                 "ble_connection_manager": "false",
             })
-        assert any(
-            r.message == "BLE coordination: no shared install at %s" % missing
-            for r in caplog.records
-        )
+        assert spy_ensure.calls == [(missing, None)]
+        assert not any("BLE coordination" in r.message for r in caplog.records)
 
     def test_broken_install_is_an_error(
         self, tmp_path, clean_import_state, caplog,
@@ -590,10 +613,10 @@ class TestInstallWithoutTheStack:
             ) is False
         errors = [r for r in caplog.records if r.levelname == "ERROR"]
         assert len(errors) == 1
-        # Verbatim shape: "... at <dir> is present but unusable: <why>".
-        assert errors[0].message.startswith(
-            "BLE coordination: shared install at %s is present but unusable: "
-            % root
+        # Verbatim: "... at <DIR> is present but unusable, running
+        # uncoordinated: <repr(exc)>".
+        assert errors[0].message == (
+            "BLE coordination: shared install at %s is present but unusable, "
+            "running uncoordinated: RuntimeError('half-installed')" % root
         )
-        assert "RuntimeError('half-installed')" in errors[0].message
         assert not [r for r in caplog.records if r.levelname == "WARNING"]

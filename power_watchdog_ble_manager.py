@@ -242,14 +242,29 @@ def load_ble_settings(config_dir: str | None = None) -> dict[str, str]:
     return dict(config["DEFAULT"]) if "DEFAULT" in config else {}
 
 
-def _log_stack_state(mode: str, shared_dir: str) -> None:
-    """One line per outcome, in the contract's words.
+_UNCOORDINATED = (
+    "running uncoordinated, no claims, no adapter routing, no card recovery"
+)
 
-    The fleet monitor greps for these three strings, so the wording is not
-    ours to improve.  "No shared install" and "shared install unusable"
-    are different operator actions and must never log alike.
+
+def _log_stack_state(mode: str, shared_dir: str) -> None:
+    """One line per outcome, in the contract's words (anchor
+    ``BLE coordination: ``).
+
+    The fleet monitor greps for these strings, so the wording is not ours
+    to improve.  The INFO line names the imported package's own directory,
+    not the configured key, so it proves which tree actually served.  "No
+    shared install" and "shared install unusable" are different operator
+    actions and must never log alike.  Called only when coordination is
+    wanted: a manager deliberately off logs no line.
     """
-    if mode == "shared":
+    if not shared_dir:
+        logger.warning(
+            "BLE coordination: ble_connection_manager is on but "
+            "ble_connection_manager_dir is empty; %s",
+            _UNCOORDINATED,
+        )
+    elif mode == "shared":
         import bleak_connection_manager as _bcm
 
         logger.info(
@@ -260,12 +275,13 @@ def _log_stack_state(mode: str, shared_dir: str) -> None:
         if ble_stack.shared_failure:
             logger.error(
                 "BLE coordination: shared install at %s is present but "
-                "unusable: %s",
+                "unusable, running uncoordinated: %s",
                 shared_dir, ble_stack.shared_failure,
             )
         else:
             logger.warning(
-                "BLE coordination: no shared install at %s", shared_dir,
+                "BLE coordination: no shared install at %s; %s",
+                shared_dir, _UNCOORDINATED,
             )
 
 
@@ -301,17 +317,15 @@ def install_ble_connection_manager(
     # An EMPTY key means never look -- a deliberate standalone run.
     if shared_dir:
         mode = ble_stack.ensure_ble_stack(shared_dir, vendored_dir=None)
-        _log_stack_state(mode, shared_dir)
     else:
         mode = "provided"  # whatever the interpreter has; never looked
-        logger.info(
-            "BLE coordination: shared install lookup disabled by config "
-            "(ble_connection_manager_dir is empty)",
-        )
 
     if not parse_bool(settings.get("ble_connection_manager"), default=True):
+        # Deliberately off: the stack was still made importable above, but
+        # the contract's coordination lines are for a manager that is on.
         logger.info("BLE connection manager disabled by config")
         return False
+    _log_stack_state(mode, shared_dir)
     if mode == "vendored":
         # Contract rule 7: on the standalone path touch nothing of the
         # library's.  The state was logged above; nothing more to say.
