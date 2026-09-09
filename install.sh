@@ -189,11 +189,13 @@ if [ -z "$RUN_FILE" ] || [ ! -f "$RUN_FILE" ]; then
 fi
 echo "Launcher: $RUN_FILE"
 grep -E '^[[:space:]]*exec[[:space:]]+[^2]' "$RUN_FILE" | sed 's/^/  /'
-grep -nE 'bcm[^[:space:]"'"'"']*/python3|BCM_PY' "$RUN_FILE" | sed 's/^/  shim residue: /'
+# Comments do not exec anything: a launcher that explains it no longer uses
+# the shim must not be refused for saying so.
+grep -vE '^[[:space:]]*#' "$RUN_FILE" | grep -nE 'bcm[^[:space:]"'"'"']*/python3|BCM_PY' | sed 's/^/  shim residue: /'
 # Same pattern BCM's own installer uses to decide whether the shim is still
 # needed on this box: a literal /data/bcm/python3, BCM_PY, or a path built
 # from ${BCM_ROOT:-/data/bcm}.
-if grep -qE 'bcm[^[:space:]"'"'"']*/python3|BCM_PY|PYTHONPATH' "$RUN_FILE"; then
+if grep -vE '^[[:space:]]*#' "$RUN_FILE" | grep -qE 'bcm[^[:space:]"'"'"']*/python3|BCM_PY|PYTHONPATH'; then
     echo ""
     echo "ERROR: $RUN_FILE still references the retired interpreter shim."
     echo "The service finds the shared BLE stack itself (ble_stack.py); the"

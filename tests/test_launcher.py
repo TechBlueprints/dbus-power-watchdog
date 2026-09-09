@@ -68,6 +68,22 @@ def test_installer_uses_the_same_pattern():
     assert "bcm[^[:space:]\"'\"'\"']*/python3|BCM_PY" in installer
 
 
+def test_installer_check_passes_our_own_launcher():
+    # Found on prod 2026-09-09: the box-side check refused THIS launcher
+    # because its comment says "no PYTHONPATH".  Run the installer's exact
+    # residue pipeline (comments stripped first) against service/run.
+    import subprocess
+
+    installer = (REPO / "install.sh").read_text()
+    start = installer.index("if grep -vE '^[[:space:]]*#' \"$RUN_FILE\" | grep -qE")
+    line = installer[start:installer.index("\n", start)]
+    condition = line[len("if "):-len("; then")]
+    rc = subprocess.run(
+        ["sh", "-c", condition], env={"RUN_FILE": str(RUN), "PATH": "/usr/bin:/bin"},
+    ).returncode
+    assert rc != 0, "installer check would refuse our own launcher"
+
+
 def test_no_other_launcher_exists():
     # One launcher: the file the /service symlink resolves to.  A second
     # run or start script is where an unmigrated exec hides.
