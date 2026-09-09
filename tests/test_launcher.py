@@ -51,7 +51,7 @@ def test_run_never_mentions_the_shim():
     "exec /data/bcm/python3 -u main.py",
     "BCM_PY=/data/bcm/python3",
     'exec "${BCM_ROOT:-/data/bcm}/python3" -u main.py',
-    "exec '${BCM_ROOT:-/data/bcm}'/python3 main.py",
+    "exec ${BCM_ROOT:-/data/bcm}/python3 main.py",
 ])
 def test_residue_pattern_matches_every_shim_form(residue):
     assert SHIM_RESIDUE.search(residue), residue
