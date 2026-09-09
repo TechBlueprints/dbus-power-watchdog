@@ -87,8 +87,11 @@ CHARACTERISTIC_UUID_GEN1_RX = "0000fff5-0000-1000-8000-00805f9b34fb"
 CHARACTERISTIC_UUID = CHARACTERISTIC_UUID_GEN2
 
 # Notification watchdog: force reconnect if no BLE notifications arrive
-# within this window.  Power Watchdog sends updates ~every 30s, so 2 minutes
-# of silence almost certainly means the radio link is dead.
+# within this window.  Measured on prod 2026-09-09 (btmon on the pinned card,
+# 200 s): the Power Watchdog sends one framed packet per second, as two ATT
+# notifications ~200 ms apart, with under 100 ms of jitter -- not the "~30s"
+# this comment used to claim from reading the source.  Two minutes of
+# silence is therefore ~120 missed frames: very loose, and certainly dead.
 NOTIFICATION_WATCHDOG_TIMEOUT = 120.0  # seconds
 
 # How often the notification watchdog checks for silence.  Well under the
