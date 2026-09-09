@@ -144,9 +144,34 @@ if [ "$BCM_OK" = true ]; then
     # Unpiped on purpose: piping through tail/tee eats the exit code, and a
     # failed smoke import must surface as an installer failure -- the library's
     # install.sh does not advance on one, and prints the rollback command.
-    "$BCM_DIR/install.sh"
-    if [ $? -ne 0 ]; then
-        BCM_OK=false
+    # Tested inside the `if` because this script runs under set -e: a bare
+    # call followed by `$?` never reaches the check (2026-09-09).
+    if "$BCM_DIR/install.sh"; then
+        :
+    else
+        # The library's installer failed.  Fatal when the stack it serves
+        # cannot be imported -- nothing else provides bleak -- but a failure
+        # in its own bookkeeping (2026-09-09: a quoting typo in its
+        # shim-reference listing, under set -e) must not hold this service on
+        # an old checkout when the stack it converged imports cleanly.  Prove
+        # that exactly the way the service will, then continue loudly.
+        echo ""
+        echo "WARNING: $BCM_DIR/install.sh failed; checking the shared stack directly..."
+        if (cd "$INSTALL_DIR" && python3 -c "
+import sys
+import ble_stack
+mode = ble_stack.ensure_ble_stack('$BCM_DIR', vendored_dir=None)
+if mode != 'shared':
+    sys.exit('shared install not importable: %s' % (ble_stack.shared_failure or mode))
+import bleak, bleak_retry_connector, bleak_connection_manager
+print('shared BLE stack imports from', bleak_connection_manager.__file__)
+"); then
+            echo "WARNING: continuing on the converged checkout. Report the"
+            echo "WARNING: library installer failure above to the BCM maintainer."
+            BCM_INSTALLER_FAILED=true
+        else
+            BCM_OK=false
+        fi
     fi
 fi
 
@@ -224,6 +249,11 @@ echo "========================================"
 echo ""
 echo "Service status:"
 svstat "/service/$SERVICE_NAME"
+if [ "${BCM_INSTALLER_FAILED:-false}" = true ]; then
+    echo ""
+    echo "NOTE: the shared BLE stack's own installer failed (see Step 3b); the"
+    echo "service runs on the converged checkout, which imports cleanly."
+fi
 echo ""
 echo "View logs:"
 echo "  tail -f /var/log/$SERVICE_NAME/current"
