@@ -369,3 +369,107 @@ class TestBleLiveness:
         svc._check_ble_liveness(_FakeData(timestamp=100.0))
 
         assert exited == []
+
+
+# ── Presence via the advertisement router ─────────────────────────────────
+#
+# _on_router_advertisement has two jobs: wake the active unit's BLE loop,
+# and discover units we do not know from the name BlueZ holds for them.
+
+
+class TestRouterAdvertisement:
+    MAC = "24:EC:4A:E4:69:A5"
+    MAC_ID = "24ec4ae469a5"
+    HUGHES = 0x2312
+
+    def _svc(self, active=None, device_info=None):
+        svc = object.__new__(pw.PowerWatchdogService)
+        svc._active_mac_id = active
+        svc._ble = MagicMock() if active else None
+        svc._device_info = dict(device_info or {})
+        svc._router_discovery_attempts = {}
+        svc._router = MagicMock()
+        svc._bus = MagicMock()
+        svc._create_device_switch = MagicMock()
+        svc._save_device_to_settings = MagicMock()
+        return svc
+
+    def _known(self):
+        from power_watchdog_ble import DiscoveredDevice
+        return {self.MAC_ID: DiscoveredDevice(mac=self.MAC, name="WD_E7_26ec4ae469a5")}
+
+    def test_active_unit_is_told_it_was_heard(self):
+        svc = self._svc(active=self.MAC_ID, device_info=self._known())
+        svc._on_router_advertisement(self.MAC, self.HUGHES, b"EV\x00\x00", -60, "684E054477B0")
+        svc._ble.notify_present.assert_called_once_with("684E054477B0")
+        svc._create_device_switch.assert_not_called()
+
+    def test_known_inactive_unit_is_left_alone(self, monkeypatch):
+        svc = self._svc(active=None, device_info=self._known())
+        lookup = MagicMock()
+        monkeypatch.setattr(pw, "bluez_device_name", lookup)
+        svc._on_router_advertisement(self.MAC, self.HUGHES, b"EV\x00\x00", -60, "hci5")
+        lookup.assert_not_called()
+        svc._create_device_switch.assert_not_called()
+
+    def test_unknown_unit_is_discovered_from_its_bluez_name(self, monkeypatch):
+        svc = self._svc()
+        monkeypatch.setattr(pw, "bluez_device_name",
+                            MagicMock(return_value="WD_E7_26ec4ae469a5"))
+        monkeypatch.setattr(pw, "resolve_adapter", MagicMock(return_value="hci5"))
+
+        svc._on_router_advertisement(self.MAC, self.HUGHES, b"EV\x00\x00", -60, "684E054477B0")
+
+        pw.bluez_device_name.assert_called_once_with(svc._bus, self.MAC, "hci5")
+        assert svc._device_info[self.MAC_ID].mac == self.MAC
+        assert svc._device_info[self.MAC_ID].generation == 2
+        svc._create_device_switch.assert_called_once_with(
+            self.MAC_ID, "WD_E7_26ec4ae469a5", enabled=False)
+        svc._save_device_to_settings.assert_called_once_with(
+            self.MAC_ID, "WD_E7_26ec4ae469a5", self.MAC, enabled=False)
+        svc._router.add_device.assert_called_once_with(self.MAC)
+
+    def test_no_name_yet_retries_after_the_quiet_period(self, monkeypatch):
+        svc = self._svc()
+        lookup = MagicMock(return_value=None)
+        monkeypatch.setattr(pw, "bluez_device_name", lookup)
+        monkeypatch.setattr(pw, "resolve_adapter", MagicMock(return_value=None))
+
+        now = [1000.0]
+        monkeypatch.setattr(pw.time, "monotonic", lambda: now[0])
+
+        svc._on_router_advertisement(self.MAC, self.HUGHES, b"EV\x00\x00", -60, "hci5")
+        svc._on_router_advertisement(self.MAC, self.HUGHES, b"EV\x00\x00", -60, "hci5")
+        assert lookup.call_count == 1                 # within the quiet period
+        svc._create_device_switch.assert_not_called()
+
+        now[0] += pw.ROUTER_DISCOVERY_RETRY + 1
+        svc._on_router_advertisement(self.MAC, self.HUGHES, b"EV\x00\x00", -60, "hci5")
+        assert lookup.call_count == 2
+
+    def test_a_name_that_is_not_a_watchdog_is_ignored(self, monkeypatch):
+        svc = self._svc()
+        monkeypatch.setattr(pw, "bluez_device_name", MagicMock(return_value="Ruuvi 1234"))
+        monkeypatch.setattr(pw, "resolve_adapter", MagicMock(return_value=None))
+        svc._on_router_advertisement(self.MAC, self.HUGHES, b"EV\x00\x00", -60, "hci5")
+        svc._create_device_switch.assert_not_called()
+        svc._save_device_to_settings.assert_not_called()
+        assert self.MAC_ID not in svc._device_info
+
+    def test_other_manufacturers_are_not_looked_up(self, monkeypatch):
+        svc = self._svc()
+        lookup = MagicMock()
+        monkeypatch.setattr(pw, "bluez_device_name", lookup)
+        svc._on_router_advertisement("AA:BB:CC:DD:EE:FF", 0x02E1, b"\x10\x02", -60, "hci5")
+        lookup.assert_not_called()
+
+    def test_router_state_gates_the_active_ble_loop(self):
+        svc = self._svc(active=self.MAC_ID, device_info=self._known())
+        svc._on_router_state(True)
+        svc._ble.set_presence_gated.assert_called_once_with(True)
+        svc._on_router_state(False)
+        svc._ble.set_presence_gated.assert_called_with(False)
+
+    def test_router_state_with_no_active_unit(self):
+        svc = self._svc()
+        svc._on_router_state(True)  # nothing to gate; must not raise

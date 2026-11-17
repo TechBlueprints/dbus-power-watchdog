@@ -41,7 +41,11 @@ models, including gen1 (BT-only) and gen2 (WiFi+BT) hardware.
 ```
 dbus-power-watchdog.py          (single process — discovery + BLE + grid service)
   ├─ Registers as com.victronenergy.switch.power_watchdog
-  ├─ Discovery toggle in Venus OS switches pane
+  ├─ Presence source, chosen at startup (see "Presence" below):
+  │    ├─ router: dbus-ble-sensors-py's advertisement router tells us when a
+  │    │  unit is heard; no scanner of ours runs, discovery toggle hidden
+  │    └─ scan:   our own BleakScanner discovery + offline poll (no router)
+  ├─ Discovery toggle in Venus OS switches pane (scan mode)
   ├─ Per-device dimmable switches (on/off + polling interval slider)
   ├─ "Report AC Input Loads" system toggle (HasAcInLoads)
   ├─ "Use Inverter Metering" system toggle (RunWithoutGridMeter)
@@ -100,16 +104,69 @@ and stays 1 while the device is off.
 
 ## Device Discovery
 
-The service scans BLE for two naming patterns:
+Units are classified by their BLE name:
 
 | Generation | BLE Name Pattern | Example |
 |------------|-----------------|---------|
 | Gen2 (WiFi+BT) | `WD_{type}_{serial}` | `WD_E7_aabbccddeeff` |
 | Gen1 (BT-only) | `PM{S\|D}...` (19 chars) | `PMD...` (50A), `PMS...` (30A) |
 
-Discovery scans use plain `BleakScanner` on the configured adapter.  Set
-`ble_wrap_scanner = true` to route scans through the connection manager's
-adapter-bound, claiming scanner instead.
+How a name gets in front of the classifier depends on the presence source
+(next section).  In **scan** mode, discovery scans use plain `BleakScanner`
+on the configured adapter; set `ble_wrap_scanner = true` to route them
+through the connection manager's adapter-bound, claiming scanner instead.
+In **router** mode there is no scan: a unit the router hears is looked up
+in BlueZ's device cache for its name.
+
+## Presence: the advertisement router, or our own scans
+
+Two questions need answering all the time: *is the enabled unit there?*
+(so the BLE session knows when to connect) and *is there a unit we have
+not seen before?* (discovery).  There are two ways to answer them, chosen
+once at startup by `presence_source` (default `auto`):
+
+| Source | Chosen when | Presence of the enabled unit | Discovery |
+|--------|-------------|------------------------------|-----------|
+| `router` | [dbus-ble-sensors-py](https://github.com/TechBlueprints/venus-os-dbus-ble-sensors-py) (or the standalone `dbus-ble-advertisements`) is installed — detected by its `/service/` entry | `Advertisement` signals from the router; while the unit is away the session waits to be told, no scanning | From the same signals; the discovery toggle is hidden |
+| `scan` | No router provider installed | BlueZ cache, then a 20 s scan, repeated every 5 min while the unit is away | Timer-driven `BleakScanner` discovery behind the toggle |
+
+**Why detect by installed files rather than by the bus.**  runit starts
+services in no particular order, so at our startup the router may simply
+not be up yet.  The *mode* therefore follows what is installed; whether the
+router is *running* is tracked live via `NameOwnerChanged`.  Until it
+appears — and whenever it goes away — the BLE session behaves exactly as
+in `scan` mode for the enabled unit, and switches to waiting on the router
+the moment its bus name shows up.
+
+**How router mode works.**  A Power Watchdog advertises Hughes'
+manufacturer ID (`0x2312`) whenever it is powered and not connected.  We
+export registration objects under `/ble_advertisements/power_watchdog/`
+on our own bus name — `mfgr/8978` for every unit, plus `addr/<MAC>` for
+each unit already in settings — *before* claiming the name, because the
+router introspects a service the moment its name appears.  Each matching
+advertisement arrives as a D-Bus signal carrying the MAC and the adapter
+that heard it.  For the enabled unit that signal ends the offline wait
+(and hints which adapter to resolve on, when the config names none); for
+an unknown MAC we read the name BlueZ has cached for it and classify as
+usual.  The immediate reconnect after a link drop is unchanged — the unit
+was there a moment ago and BlueZ most likely still has it — only the
+"unit is away" poll is replaced.
+
+**Safety net.**  While waiting on the router the session still makes one
+blind resolve every `presence_fallback_interval` (default 900 s).  That
+covers a router that has stopped emitting, and gen1 `PM*` units, whose
+advertisement is not confirmed to carry any manufacturer data the router
+could match on.  900 s is also the router's own keepalive period for a
+unit advertising constant data, so nothing it *can* hear waits longer.
+
+**Known limits of router mode.**  The router only forwards manufacturer
+data, not the local name, and only re-introspects us when our bus name
+appears — so `addr/` registrations added for a unit discovered at runtime
+take effect at the router's next restart (harmless: the `mfgr/` path
+already carries it).  A gen1 unit with no manufacturer data can neither be
+discovered nor heard through the router; it still connects via the blind
+fallback, and `presence_source = scan` restores the old behaviour
+entirely.
 
 ## Requirements
 
@@ -186,7 +243,9 @@ git submodule update --init --recursive
 1. Install the service (see above)
 2. Open the Venus OS Remote Console or VRM
 3. Navigate to **Settings > I/O > Switches** (or the device list)
-4. Find "Power Watchdog Manager" and enable **Device Discovery**
+4. Find "Power Watchdog Manager" and enable **Device Discovery** (with
+   dbus-ble-sensors-py installed there is no toggle: units are discovered
+   as soon as the router hears them)
 5. Discovered Power Watchdog devices will appear as dimmable switches
 6. Enable a device to start reading AC data (only one may be active at a time)
 7. Use the slider to adjust the polling interval (100ms-10000ms)
@@ -329,7 +388,14 @@ reconnect_max_delay = 120
 ble_connection_manager = true
 ble_link_caps = hci0:5
 ble_wrap_scanner = false
+presence_source = auto
+presence_fallback_interval = 900
 ```
+
+`presence_source` is `auto` (follow what is installed), `router` (always
+wire into the advertisement router, waiting for it if it is down) or
+`scan` (always run our own scans).  `presence_fallback_interval` is the
+blind-resolve period underneath the router gate.  See "Presence" above.
 
 The polling interval is configured per-device via the GUI slider (see above)
 and is not in the config file.  All other configuration is optional.  By

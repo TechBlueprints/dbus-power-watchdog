@@ -34,3 +34,6 @@ sample-driver/
 BLE-INCIDENTS-ARCHIVE.md
 
 # ext/velib_python is committed -- it's the standard Venus OS Python library
+
+# Test virtualenv (see README "Running the tests")
+.venv/

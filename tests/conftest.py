@@ -30,6 +30,18 @@ _dbus.Int32 = int
 _dbus.Interface = MagicMock()
 _dbus.service = types.ModuleType("dbus.service")
 _dbus.service.BusName = MagicMock()
+
+
+class _FakeDbusObject:
+    """Stand-in for dbus.service.Object: records where it was exported."""
+
+    def __init__(self, conn=None, object_path=None, bus_name=None):
+        self.conn = conn
+        self.object_path = object_path
+        self.bus_name = bus_name
+
+
+_dbus.service.Object = _FakeDbusObject
 _dbus.exceptions = types.ModuleType("dbus.exceptions")
 _dbus.exceptions.DBusException = type("DBusException", (Exception,), {})
 _dbus_mainloop_glib = types.ModuleType("dbus.mainloop.glib")

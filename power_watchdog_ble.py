@@ -52,7 +52,7 @@ from bleak_retry_connector import (
     get_device_by_adapter,
 )
 
-from power_watchdog_ble_manager import scan_adapter_for
+from power_watchdog_ble_manager import resolve_adapter, scan_adapter_for
 
 try:
     # Stdlib-only in the library (it never imports bleak), but this module
@@ -105,6 +105,16 @@ SCAN_TIMEOUT = 20.0  # seconds
 # against a busy or wedged radio can fail every few seconds for hours; the
 # first line carries the diagnosis and the rest only bury it.
 BLE_ERROR_LOG_INTERVAL = 300.0  # seconds
+
+# Presence gating (router mode -- see power_watchdog_presence).  While the
+# unit is away and the advertisement router has not heard it, the session
+# loop still makes one blind resolve (BlueZ cache, then a scan) this often.
+# It is the safety net under the gate: a gen1 unit whose advertisement may
+# carry no manufacturer data for the router to match, or a router that has
+# stopped emitting.  It equals the router's own dedup keepalive (a unit
+# advertising constant data is re-forwarded every 15 minutes), so nothing
+# the router *can* hear waits longer than this even in the worst case.
+PRESENCE_FALLBACK_INTERVAL = 900.0  # seconds
 
 
 class NotificationWatchdog:
@@ -518,6 +528,8 @@ class PowerWatchdogBLE:
         reconnect_delay: float = 10.0,
         reconnect_max_delay: float = 120.0,
         ble_adapters: list[str] | None = None,
+        presence_gated: bool = False,
+        presence_fallback_interval: float = PRESENCE_FALLBACK_INTERVAL,
     ):
         self.address = address
         self.reconnect_delay = reconnect_delay
@@ -557,6 +569,20 @@ class PowerWatchdogBLE:
         # liveness signal — see the connect_cycles property.
         self._connect_cycles = 0
 
+        # Presence gating.  With the advertisement router on the bus the
+        # main thread tells us when the unit was heard (notify_present) and
+        # the offline path waits for that instead of polling the air; the
+        # gate can be switched at runtime as the router comes and goes.
+        # Both stamps are monotonic; "fresh" means heard since we last
+        # went looking, so one signal buys exactly one resolve attempt.
+        self._presence_gated = presence_gated
+        self._presence_fallback_interval = presence_fallback_interval
+        self._last_seen = 0.0
+        self._seen_adapter: str | None = None  # verbatim from the router
+        self._last_resolve_attempt = 0.0
+        self._offline = False  # the last resolve found nothing
+        self._waiting_for_presence = False
+
         # asyncio event loop reference (set by daemon thread)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._sleep_task: asyncio.Task | None = None
@@ -586,8 +612,103 @@ class PowerWatchdogBLE:
         simply unplugged: an unplugged unit still advances this every
         ``OFFLINE_POLL_INTERVAL``, and a healthy connected one sits in a
         single long session with a frozen counter but flowing data.
+
+        Presence gating keeps that contract: a wait for the router is cut
+        into slices no longer than ``OFFLINE_POLL_INTERVAL``, each one a
+        loop iteration, so an unheard unit advances this at the same rate
+        an unplugged one always has.
         """
         return self._connect_cycles
+
+    # ── Presence (router mode) ──────────────────────────────────────────────
+
+    @property
+    def presence_gated(self) -> bool:
+        return self._presence_gated
+
+    def notify_present(self, interface: str | None = None) -> None:
+        """The advertisement router just heard our unit.  Any thread.
+
+        ``interface`` names the card that heard it, verbatim from the
+        router (an adapter MAC, or ``hciN``); it is only translated at the
+        point of use, by ``_resolve_device``.
+        """
+        self._seen_adapter = interface or None
+        self._last_seen = time.monotonic()
+        self._wake_if_waiting()
+
+    def set_presence_gated(self, gated: bool) -> None:
+        """Switch the offline path between waiting for the router and polling.
+
+        Called as the router's bus name comes and goes.  Any thread.
+        """
+        if gated == self._presence_gated:
+            return
+        self._presence_gated = gated
+        logger.info(
+            "Presence for %s now comes from %s",
+            self.address,
+            "the advertisement router" if gated else "our own scans",
+        )
+        self._wake_if_waiting()
+
+    def _wake_if_waiting(self) -> None:
+        # Only a presence wait is worth interrupting: a reconnect backoff
+        # after a failed connect is there to protect the radio, and the
+        # connected loop's one-second tick does not care.
+        loop = self._loop
+        if self._waiting_for_presence and loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(self._cancel_sleep)
+
+    def _presence_fresh(self) -> bool:
+        """Heard since we last went looking?"""
+        return self._last_seen > self._last_resolve_attempt
+
+    def _blind_retry_due(self) -> bool:
+        return (
+            time.monotonic() - self._last_resolve_attempt
+            >= self._presence_fallback_interval
+        )
+
+    def _should_wait_for_presence(self) -> bool:
+        """Gate for the top of the session loop.
+
+        True only while every condition holds: the router is the presence
+        source, the last resolve found nothing, the router has not heard
+        the unit since, and the blind-retry interval has not lapsed.  Any
+        of them failing means go and look -- the startup connect and the
+        reconnect after a drop are never gated, because the unit was
+        there a moment ago and BlueZ most likely still has it.
+        """
+        return (
+            self._presence_gated
+            and self._offline
+            and not self._presence_fresh()
+            and not self._blind_retry_due()
+        )
+
+    async def _presence_wait_slice(self) -> None:
+        """Sleep until the router hears the unit, the blind retry is due,
+        or ``OFFLINE_POLL_INTERVAL`` passes -- whichever is first.
+
+        One slice per loop iteration, so ``connect_cycles`` keeps moving.
+        """
+        remaining = self._presence_fallback_interval - (
+            time.monotonic() - self._last_resolve_attempt
+        )
+        self._waiting_for_presence = True
+        try:
+            await self._interruptible_sleep(
+                max(0.0, min(remaining, self.OFFLINE_POLL_INTERVAL))
+            )
+        finally:
+            self._waiting_for_presence = False
+        if self._presence_fresh():
+            logger.info(
+                "Advertisement router heard Power Watchdog %s%s; connecting",
+                self.address,
+                " on %s" % self._seen_adapter if self._seen_adapter else "",
+            )
 
     def get_data(self) -> WatchdogData:
         """Return a snapshot of the latest data (thread-safe)."""
@@ -701,17 +822,40 @@ class PowerWatchdogBLE:
             self._connect_cycles += 1
 
             try:
-                # Step 1: Resolve a BLEDevice — BlueZ cache, then a scan
-                device = await self._resolve_device()
+                # Step 0 (router mode): while the unit is away, wait to be
+                # told it is back rather than asking the air every five
+                # minutes.  See _should_wait_for_presence for what ends it.
+                if self._should_wait_for_presence():
+                    await self._presence_wait_slice()
+                    continue
+
+                # Step 1: Resolve a BLEDevice — BlueZ cache, then a scan.
+                # The presence stamp is consumed here: a signal that lands
+                # during the scan still counts as fresh, and one that came
+                # before it has bought this attempt.
+                adapter_hint = self._seen_adapter if self._presence_fresh() else None
+                self._last_resolve_attempt = time.monotonic()
+                device = await self._resolve_device(adapter_hint)
 
                 if device is None:
-                    logger.warning(
-                        "Power Watchdog %s not found (offline?), "
-                        "retrying in %.0fs",
-                        self.address, self.OFFLINE_POLL_INTERVAL,
-                    )
-                    await self._interruptible_sleep(self.OFFLINE_POLL_INTERVAL)
+                    self._offline = True
+                    if self._presence_gated:
+                        logger.warning(
+                            "Power Watchdog %s not found (offline?); waiting "
+                            "for the advertisement router to hear it, "
+                            "looking blind every %.0fs",
+                            self.address, self._presence_fallback_interval,
+                        )
+                        await self._presence_wait_slice()
+                    else:
+                        logger.warning(
+                            "Power Watchdog %s not found (offline?), "
+                            "retrying in %.0fs",
+                            self.address, self.OFFLINE_POLL_INTERVAL,
+                        )
+                        await self._interruptible_sleep(self.OFFLINE_POLL_INTERVAL)
                     continue
+                self._offline = False
 
                 # Step 2: Connect.  bleak-retry-connector owns the retry
                 # cadence and the error classification; BleakClient here is
@@ -988,7 +1132,7 @@ class PowerWatchdogBLE:
             self.address, exc.__class__.__name__, detail, repeat, delay,
         )
 
-    async def _resolve_device(self) -> BLEDevice | None:
+    async def _resolve_device(self, adapter_hint: str | None = None) -> BLEDevice | None:
         """Resolve a BLEDevice for our address: BlueZ cache first, then scan.
 
         The cache lookup costs no radio time and is usually enough — BlueZ
@@ -996,8 +1140,15 @@ class PowerWatchdogBLE:
         D-Bus path, which is what decides the adapter the link is made on.
         A scan is the fallback for a device BlueZ has forgotten, or for the
         first connect after a bluetoothd restart.
+
+        ``adapter_hint`` is the card the advertisement router heard the
+        unit on.  Configured placement wins; the hint only fills in when
+        the config names no adapter, and it is translated to an ``hciN``
+        here, at the point of use, like every other adapter name.
         """
         adapter = scan_adapter_for(self.address, self._ble_adapters or [])
+        if adapter is None and adapter_hint:
+            adapter = resolve_adapter(adapter_hint)
 
         if self._force_scan:
             self._force_scan = False

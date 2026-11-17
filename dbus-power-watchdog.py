@@ -59,7 +59,7 @@ sys.path.insert(1, os.path.join(_ext_dir, "velib_python"))
 from vedbus import VeDbusService  # noqa: E402
 from settingsdevice import SettingsDevice  # noqa: E402
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,12 +79,21 @@ logger = logging.getLogger("dbus-power-watchdog")
 # process.  Running it as the service is the only case that wants that.
 from power_watchdog_ble_manager import (  # noqa: E402
     install_ble_connection_manager,
+    resolve_adapter,
+)
+from power_watchdog_presence import (  # noqa: E402
+    AdvertisementRouterClient,
+    HUGHES_MANUFACTURER_ID,
+    bluez_device_name,
+    resolve_presence_source,
+    router_provider_installed,
 )
 
 if __name__ == "__main__":
     install_ble_connection_manager()
 
 from power_watchdog_ble import (  # noqa: E402
+    PRESENCE_FALLBACK_INTERVAL,
     PowerWatchdogBLE,
     scan_for_devices,
     classify_device,
@@ -102,6 +111,13 @@ POLL_INTERVAL_MS_PER_STEP = 100
 # Default reconnect parameters for the BLE client
 DEFAULT_RECONNECT_DELAY = 10
 DEFAULT_RECONNECT_MAX_DELAY = 120
+
+# Router mode: minimum gap between name lookups for one MAC the router
+# hears with Hughes' manufacturer ID but we do not know yet.  BlueZ may
+# not have the name on the first report; the router re-forwards a unit's
+# (constant) advertisement about every 15 minutes, so this mostly just
+# stops a burst from turning into repeated lookups.
+ROUTER_DISCOVERY_RETRY = 300.0  # seconds
 
 # How long the BLE thread may show no progress at all — neither a connect
 # attempt nor a telemetry frame — before we exit and let runit restart us.
@@ -203,7 +219,34 @@ class PowerWatchdogService:
                 ", ".join(self._ble_adapters),
             )
 
-        logger.info("Scan interval: %ds", self._scan_interval)
+        # Presence source -- decided from what is INSTALLED, because runit
+        # gives no start order and the router may not be up yet when we
+        # are.  Whether it is *running* is tracked live once we are on the
+        # bus (see _on_router_state).  power_watchdog_presence has the why.
+        installed = router_provider_installed()
+        self._presence_source = resolve_presence_source(
+            defaults.get("presence_source"), installed,
+        )
+        self._router_mode = self._presence_source == "router"
+        self._presence_fallback_interval = float(
+            defaults.get("presence_fallback_interval", str(PRESENCE_FALLBACK_INTERVAL))
+        )
+        if self._router_mode:
+            logger.info(
+                "Presence source: advertisement router (%s); running no "
+                "scanner of our own, discovery toggle hidden",
+                installed or "forced by presence_source=router",
+            )
+        else:
+            logger.info(
+                "Presence source: own BLE scans%s (scan interval %ds)",
+                " -- a router provider is installed but presence_source=scan"
+                if installed else "",
+                self._scan_interval,
+            )
+        self._router: AdvertisementRouterClient | None = None
+        # Router-mode discovery: mac_id -> monotonic of the last name lookup.
+        self._router_discovery_attempts: dict[str, float] = {}
 
         # D-Bus connection
         self._bus = get_bus()
@@ -284,7 +327,12 @@ class PowerWatchdogService:
         self._dbusservice.add_path("%s/Settings/Function" % discovery_path, 2, writeable=True)
         self._dbusservice.add_path("%s/Settings/ValidFunctions" % discovery_path, 4)
         self._dbusservice.add_path("%s/Settings/Group" % discovery_path, "", writeable=True)
-        self._dbusservice.add_path("%s/Settings/ShowUIControl" % discovery_path, 1, writeable=True)
+        # Hidden in router mode: there is no scanner for the toggle to
+        # drive -- new units arrive from the router's feed on their own.
+        self._dbusservice.add_path(
+            "%s/Settings/ShowUIControl" % discovery_path,
+            0 if self._router_mode else 1, writeable=True,
+        )
         self._dbusservice.add_path("%s/Settings/PowerOnState" % discovery_path, 1)
 
         # ── HasAcInLoads toggle switch ───────────────────────────────────
@@ -352,9 +400,29 @@ class PowerWatchdogService:
             timeout=10,
         )
 
+        # Restore previously discovered devices from settings -- before the
+        # name is claimed, so the router registrations below cover every
+        # unit we already know about.
+        self._restore_devices_from_settings()
+
+        # Router registrations must be exported BEFORE the bus name is
+        # claimed: the router introspects us the moment our name appears,
+        # and a path that is not there yet stays unknown to it until its
+        # next restart.  See power_watchdog_presence.
+        if self._router_mode:
+            self._router = AdvertisementRouterClient(
+                self._bus,
+                on_advertisement=self._on_router_advertisement,
+                on_router_state=self._on_router_state,
+                known_macs=[d.mac for d in self._device_info.values() if d.mac],
+            )
+
         # Register switch service on D-Bus
         self._dbusservice.register()
         logger.info("Registered discovery service on D-Bus")
+
+        if self._router is not None:
+            self._router.start()
 
         # Restore HasAcInLoads toggle and apply
         has_ac_in_loads = int(self._settings["HasAcInLoads"])
@@ -366,13 +434,15 @@ class PowerWatchdogService:
         self._dbusservice["/SwitchableOutput/relay_inverter_metering/State"] = run_without
         self._apply_run_without_grid_meter(run_without)
 
-        # Restore previously discovered devices from settings
-        self._restore_devices_from_settings()
-
         # Restore discovery state
         discovery_state = self._settings["DiscoveryEnabled"]
         self._dbusservice["/SwitchableOutput/relay_discovery/State"] = discovery_state
-        if discovery_state:
+        if discovery_state and self._router_mode:
+            logger.info(
+                "Discovery enabled in settings; in router mode new units "
+                "come from the advertisement feed, no scan is started"
+            )
+        elif discovery_state:
             logger.info("Discovery enabled from saved settings")
             self._start_scanning()
 
@@ -439,6 +509,13 @@ class PowerWatchdogService:
         logger.info("Discovery %s", "enabled" if enabled else "disabled")
         self._settings["DiscoveryEnabled"] = 1 if enabled else 0
 
+        if self._router_mode:
+            # The toggle is hidden in this mode; honour a write anyway by
+            # persisting it, but there is no scanner to start or stop and
+            # the device switches stay visible regardless.
+            logger.info("Router mode: discovery toggle drives no scanner")
+            return True
+
         if enabled:
             self._start_scanning()
             for mac_id in self._device_info:
@@ -456,6 +533,11 @@ class PowerWatchdogService:
     # ── BLE Scanning ────────────────────────────────────────────────────────
 
     def _start_scanning(self):
+        if self._router_mode:
+            # Belt and braces: every caller already checks, but a scanner
+            # of ours fighting the router for the adapter is the one thing
+            # router mode exists to prevent.
+            return
         if self._scan_timer_id is not None:
             return
         logger.info("Starting BLE discovery (interval: %ds)", self._scan_interval)
@@ -509,6 +591,76 @@ class PowerWatchdogService:
             self._create_device_switch(mac_id, device.name, enabled=False)
             self._save_device_to_settings(mac_id, device.name, device.mac, enabled=False)
         return False
+
+    # ── Presence via the advertisement router ──────────────────────────────
+
+    def _on_router_state(self, available: bool):
+        """The router's bus name appeared or went away."""
+        if self._ble is not None:
+            self._ble.set_presence_gated(available)
+
+    def _on_router_advertisement(self, mac: str, mfg_id: int, data: bytes,
+                                 rssi: int, interface: str):
+        """One advertisement the router matched to a registration of ours.
+
+        Two jobs: tell the active unit's BLE loop it was heard (that is
+        what ends its offline wait), and discover units we do not know.
+        Main thread; the BLE loop is woken across the thread boundary by
+        notify_present itself.
+        """
+        mac_id = mac.replace(":", "").lower()
+        if mac_id == self._active_mac_id and self._ble is not None:
+            self._ble.notify_present(interface)
+        if mac_id in self._device_info:
+            return
+        if mfg_id != HUGHES_MANUFACTURER_ID:
+            return
+        self._discover_from_router(mac, mac_id, interface)
+
+    def _discover_from_router(self, mac: str, mac_id: str, interface: str):
+        """Classify a unit the router heard, from the name BlueZ has for it.
+
+        The router forwards no local name, and the name is what tells a
+        gen2 WD_* unit from a gen1 PM* one (and the line count).  bluetoothd
+        sees the same reports the router's tap does, so the name is a
+        property read on its Device1 object -- no radio time.  If it has
+        no name yet we try again on a later advertisement.
+        """
+        now = time.monotonic()
+        if now - self._router_discovery_attempts.get(mac_id, 0.0) < ROUTER_DISCOVERY_RETRY:
+            return
+        self._router_discovery_attempts[mac_id] = now
+
+        hint = resolve_adapter(interface) if interface else None
+        name = bluez_device_name(self._bus, mac, hint)
+        if not name:
+            logger.info(
+                "Advertisement router heard %s with Hughes' manufacturer ID, "
+                "but BlueZ has no name for it yet; will look again",
+                mac,
+            )
+            return
+
+        classified = classify_device(name)
+        if classified is None:
+            logger.info(
+                "Advertisement router heard %s (%r) with Hughes' manufacturer "
+                "ID, but the name is not a Power Watchdog's; ignoring",
+                mac, name,
+            )
+            return
+
+        classified.mac = mac
+        logger.info(
+            "New Power Watchdog discovered via the advertisement router: "
+            "%s (%s) gen%d %s",
+            name, mac, classified.generation, classified.device_type,
+        )
+        self._device_info[mac_id] = classified
+        self._create_device_switch(mac_id, name, enabled=False)
+        self._save_device_to_settings(mac_id, name, mac, enabled=False)
+        if self._router is not None:
+            self._router.add_device(mac)
 
     # ── Per-device switch management ───────────────────────────────────────
     #
@@ -711,6 +863,10 @@ class PowerWatchdogService:
             reconnect_delay=self._reconnect_delay,
             reconnect_max_delay=self._reconnect_max_delay,
             ble_adapters=self._ble_adapters,
+            # Gated only while the router is actually on the bus; until it
+            # shows up (or if it goes away) the loop polls as it always has.
+            presence_gated=self._router is not None and self._router.available,
+            presence_fallback_interval=self._presence_fallback_interval,
         )
 
         # Fresh BLE object: its cycle counter restarts at zero, so clear the
