@@ -13,5 +13,5 @@
 # bleak-connection-manager itself is deliberately absent: the tests stub it,
 # and its absence exercises the documented "connect uncoordinated" path.
 bleak==3.0.2
-bleak-retry-connector==4.6.0
+bleak-retry-connector==4.7.0
 pytest>=7.0

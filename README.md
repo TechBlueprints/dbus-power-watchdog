@@ -89,6 +89,14 @@ Each enabled device registers as `com.victronenergy.grid.power_watchdog_{mac}`
 | `/Ac/L2/*` | Line 2 measurements (50A models) |
 | `/Ac/Power` | Total AC power (W) |
 | `/ErrorCode` | Current error code |
+| `/Connected` | 1 while the BLE link to the Power Watchdog is up, 0 while it is offline and retrying |
+| `/LastUpdate` | Unix time of the last parsed frame from the device (refreshed at most once per 60 s) |
+
+Read the device's health from the **grid** service: `/Connected` for the link,
+and `now - /LastUpdate` for whether frames are still arriving. The separate
+`com.victronenergy.switch.power_watchdog` service is the manager (discovery and
+the per-device enable switches), so its own `/Connected` describes the manager
+and stays 1 while the device is off.
 
 ## Device Discovery
 
