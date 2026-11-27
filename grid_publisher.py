@@ -25,30 +25,50 @@ a single device).  Each signal fans out to every D-Bus subscriber
 (gui-v2, vrmlogger, dbus-systemcalc, mqtt-rpc, ...), so reducing the
 emit volume helps the entire bus, not just this process.
 
-This module owns the four optimizations stacked on the publish path:
+This module owns the optimizations stacked on the publish path:
 
 1. **Batched writes** — all per-cycle property writes happen inside a
    single ``with svc:`` context so vedbus's refcounted batching
    coalesces them into one ``ItemsChanged`` signal at exit.
-2. **Coarse rounding** — values are rounded to a step coarser than the
-   device's noise floor.  A steady underlying load produces a steady
-   rounded value, so vedbus's per-path "value didn't change" dedup
-   actually catches it.
-3. **Local in-RAM cache** — the last value written to each path is
+2. **Hysteresis gate on the live measurements** — the twelve live
+   paths (V / I / P / Frequency on each leg and the totals) publish as
+   one frame, and only when something triggers it: a reading that has
+   moved at least one band (``GRID_*_BAND``) from the reading at the
+   last *published* frame, a displayed zero/non-zero transition, a path
+   with no reference yet (first frame, after ``reset()`` or a
+   disconnect, a newly present leg or frequency), or any ungated path
+   (``/Connected``, ``/LastUpdate``, energy counters, ``/NrOfPhases``,
+   ``/ErrorCode``, ``/ErrorMessage``, ``/Alarms/*``) actually being
+   written in the same frame.  References move only on publish, so a
+   slow drift accumulates until it crosses the band, and a reading
+   flapping across a rounding boundary stays silent — the failure mode
+   rounded-equality dedup could not remove.  Every signal carries one
+   coherent frame (never a new power beside an old current), and since
+   the once-a-minute ``/LastUpdate`` write publishes the frame, a held
+   value is at most ``LAST_UPDATE_INTERVAL`` stale.  Nothing is
+   re-published on a timer beyond that.
+3. **Display rounding** — published values are rounded to a display
+   step (``GRID_*_STEP``) and cleaned to the step's decimal places, so
+   ``2.9`` goes out as ``2.9`` rather than ``2.9000000000000004``.
+4. **Local in-RAM cache** — the last value written to each path is
    stored in a python dict.  Skipping the ``svc[path] = value`` call
    entirely on no-op writes avoids the
    ``__setitem__`` -> ``ServiceContext.__setitem__`` ->
    ``_local_set_value`` Python call chain that vedbus would walk on
    every cycle just to return early.
-4. **/UpdateIndex gated on real change** — the rolling counter is only
+5. **/UpdateIndex gated on real change** — the rolling counter is only
    bumped when at least one *other* path actually changed.  When the
    grid is steady, no writes get through and vedbus suppresses the
    ItemsChanged signal entirely.  When data does change, /UpdateIndex
    bumps and rides along in the same IC.
 
-Combined effect on a busy Cerbo running at 500 ms poll: pre-batching
-emits ~5 PropertiesChanged/sec; with everything on, ~0.5 IC/sec — a
-~10× drop in bus traffic just from this one device.
+Signal count is decided by the triggers alone, not by the poll rate:
+on a flat load the service emits one ItemsChanged a minute (the
+``/LastUpdate`` tick) plus one per energy-counter tick.  Under the old
+rounded-equality gate a reading sitting on a step boundary signalled
+on nearly every poll (0.6-0.7 IC/s measured on prod on 2026-11-26 at a
+1400 ms poll); replaying a 900 s prod capture through this code leaves
+0.136 IC/s (see the GRID_*_BAND comments).
 
 Caller contract:
 
@@ -64,24 +84,84 @@ Caller contract:
 
 from __future__ import annotations
 
-# Per-quantity rounding step.  Tuned to the noise floor of the Power
-# Watchdog's reported values: voltages flicker ±0.1 V, currents ±0.01 A,
-# power ±1-2 W when the grid is steady.  Rounding to a multiple of
-# these values lets vedbus's per-path dedup eliminate the flicker.
+import decimal
+import functools
+
+# Per-quantity display step.  Published values are rounded to a
+# multiple of these.  They decide what the GUI shows, not when a signal
+# goes out: that is the hysteresis bands' job (below).
 GRID_VOLTAGE_STEP = 0.5     # V — grid is 120 V ±5%; 0.5 V resolution still useful
-GRID_CURRENT_STEP = 0.05    # A — kills 10-50 mA noise; 50 mA = ~6 W at 120 V
-GRID_POWER_STEP = 5         # W — kills 1-2 W noise; useful loads are ≥ 5 W anyway
+GRID_CURRENT_STEP = 0.05    # A — 50 mA = ~6 W at 120 V
+GRID_POWER_STEP = 5         # W — useful loads are ≥ 5 W anyway
+GRID_FREQ_STEP = 0.1        # Hz — frequency is genuinely stable, no coarsening
+GRID_ENERGY_STEP = 0.01     # kWh — counter, monotone, fine resolution useful
+
+# Hysteresis bands for the live measurements.  A frame is published when
+# any reading has moved at least its band from the reading at the last
+# published frame (see GridPublisher._gate_tripped for the other
+# triggers).  Each band should sit above the reading's measured
+# frame-to-frame noise on a steady load, so noise alone never trips it.
+# Energy counters are not banded: they publish on every GRID_ENERGY_STEP.
+#
+# Measured on prod, 2026-11-27 16:46:24Z-17:01:24Z (900 s, /RefreshTime
+# 1400 ms, light load drifting slowly, L1 215-360 W, no air-conditioner
+# cycle): 568 signals = 0.631/s, 88 % of timer ticks.  Capture and analysis:
+# measurements/2026-11-27-grid-values-prod.json, reproduced by
+#     python3 scripts/grid_value_capture.py --report <that file>
+#     python3 scripts/grid_value_capture.py --sweep <that file>
+#     python3 scripts/grid_value_capture.py --replay-publisher <that file>
+# The last one runs the capture through this module: with these bands it
+# leaves 122 signals = 0.136/s, 21 % of before.  (--sweep's model says
+# 0.148/s; it gates the captured /Ac/* totals as readings of their own,
+# while this code derives them from the legs, and that accounts for all
+# 11 extra signals.)  The floor from energy ticks plus /LastUpdate is
+# 0.025/s.
+#
+# The power, current and voltage bands are two display steps each: the
+# smallest band that clears one-step flapping, which was most of the
+# churn (frequency's is one step and unmeasured).  Wider bands would cut
+# further (15 W / 0.15 A: 0.091/s in the sweep, a further ~0.057/s) at
+# the price of holding back changes up to that size for as long as
+# LAST_UPDATE_INTERVAL.  Limits: the replay ran on values already rounded
+# to the display steps, from one capture under one load condition; the
+# measurement after deploy decides whether to widen.
+GRID_POWER_BAND = 10        # W  — 662 changes over the 3 power paths, 48.6 % flaps
+                            #      across one 5 W boundary; /Ac/Power 267 of 333
+                            #      changes one step, 32 two.  Sweep, signals/s with
+                            #      a power cause: 10 W 0.108, 15 W 0.061, 20 W 0.047,
+                            #      30 W 0.018.
+GRID_CURRENT_BAND = 0.1     # A  — 534 changes, 56.6 % flaps; /Ac/L1/Current 228 of
+                            #      275 one step; idle L2 flapped 0.4/0.45 A (25 of
+                            #      26).  Sweep, with a current cause: 0.1 A 0.067,
+                            #      0.15 A 0.026, 0.2 A 0.007.
+GRID_VOLTAGE_BAND = 1.0     # V  — 116 changes, 86.2 % flaps, all but two one 0.5 V
+                            #      step.  Sweep: 1.0 V leaves 0.002/s with a voltage
+                            #      cause; 1.5 V and 2.0 V remove nothing more.
+GRID_FREQ_BAND = 0.1        # Hz — NOT measured: frequency read 60.0 throughout the
+                            #      900 s, no change at all.  One display step.
 
 # How often /LastUpdate is rewritten while parsed telemetry flows.  It is
-# the freshness signal the flicker-suppressed measurement paths cannot be:
+# the freshness signal the hysteresis-gated measurement paths cannot be:
 # a flat load leaves them (and therefore /UpdateIndex) unchanged for as
 # long as it stays flat, which is indistinguishable from a parser that has
 # stopped producing.  One write a minute is a bounded D-Bus cost and makes
 # /UpdateIndex advance at least that often whenever real frames are being
-# parsed — and never when they are not.
+# parsed — and never when they are not.  Because it is an ungated write,
+# it also publishes the frame's measurements, so a held reading is never
+# more than this stale.
 LAST_UPDATE_INTERVAL = 60.0  # seconds
-GRID_FREQ_STEP = 0.1        # Hz — frequency is genuinely stable, no coarsening
-GRID_ENERGY_STEP = 0.01     # kWh — counter, monotone, fine resolution useful
+
+# The live measurement paths, nulled on disconnect and hysteresis-gated
+# while connected.
+GRID_LIVE_PATHS: tuple[str, ...] = (
+    "/Ac/L1/Voltage", "/Ac/L1/Current", "/Ac/L1/Power", "/Ac/L1/Frequency",
+    "/Ac/L2/Voltage", "/Ac/L2/Current", "/Ac/L2/Power", "/Ac/L2/Frequency",
+    "/Ac/Power", "/Ac/Current", "/Ac/Voltage", "/Ac/Frequency",
+)
+
+# Relative slack on band and step comparisons, so a move of exactly one
+# band (e.g. 10.1 - 10.0 = 0.09999999999999964) counts as one band.
+_CMP_EPS = 1e-9
 
 
 # /Alarms/* paths surfaced on the grid service.  venus-platform watches
@@ -142,29 +222,40 @@ ERROR_MESSAGES = {
 }
 
 
+@functools.lru_cache(maxsize=None)
+def _step_decimals(step: float) -> int:
+    """Decimal places of *step* as written: 0.05 -> 2, 0.5 -> 1, 5 -> 0."""
+    return max(0, -decimal.Decimal(str(step)).as_tuple().exponent)
+
+
 def _round_to(value: float, step: float) -> float:
-    """Round *value* to the nearest multiple of *step*.
+    """Round *value* to the nearest multiple of *step*, as a clean decimal.
 
-    Coarser-than-decimal rounding kills measurement-noise flicker that
-    would otherwise defeat vedbus's per-path "value didn't change"
-    dedup, causing every poll cycle to emit an ItemsChanged signal
-    even when the underlying load is steady.
+    ``round(value / step) * step`` picks the bucket; the product is then
+    rounded to the step's own decimal places, which removes binary
+    noise (``58 * 0.05`` is ``2.9000000000000004``) without moving the
+    value to a different bucket.  An int step on an int-valued bucket
+    stays an int.
 
-    Example: a US-grid voltage reading flickering between 119.4 V and
-    119.5 V every cycle survives ``round(x, 1)`` (returns 119.4 vs
-    119.5) but collapses under ``_round_to(x, 0.5)`` (both round to
-    119.5).
+    Example: a US-grid voltage of 119.4 V rounds to 119.5 V at a 0.5 V
+    step.  Rounding only decides what is displayed; whether the value
+    is published is the hysteresis gate's decision.
     """
     if step <= 0:
         return value
-    return round(value / step) * step
+    bucketed = round(value / step) * step
+    if isinstance(step, int):
+        return bucketed
+    return round(bucketed, _step_decimals(step))
 
 
 class GridPublisher:
     """Publishes a ``WatchdogData`` snapshot to a vedbus grid service.
 
-    Owns the rolling ``/UpdateIndex`` counter and an in-RAM cache of
-    the last value written to each path.  Both reset on ``reset()``.
+    Owns the rolling ``/UpdateIndex`` counter, an in-RAM cache of the
+    last value written to each path, and the hysteresis references (the
+    live readings at the last published frame).  All reset on
+    ``reset()``.
 
     Thread-safety: not thread-safe.  Call from the GLib mainloop only.
     """
@@ -174,9 +265,12 @@ class GridPublisher:
         self._last_values: dict[str, object] = {}
         # Epoch of the last /LastUpdate we wrote; 0 forces the first write.
         self._last_update_published: float = 0.0
+        # Live path -> unrounded reading at the last published frame.
+        # Empty means "no reference": the next data frame publishes.
+        self._references: dict[str, float] = {}
 
     def reset(self) -> None:
-        """Drop the dedup cache and reset ``/UpdateIndex``.
+        """Drop the dedup cache and references, and reset ``/UpdateIndex``.
 
         Call this when the underlying ``VeDbusService`` is destroyed
         and recreated (e.g. role change), so a fresh service doesn't
@@ -185,6 +279,7 @@ class GridPublisher:
         self._update_index = 0
         self._last_values.clear()
         self._last_update_published = 0.0
+        self._references.clear()
 
     def _set_if_changed(self, ctx, path: str, value) -> bool:
         """Write *value* to *ctx[path]* iff the local cache shows it
@@ -205,6 +300,37 @@ class GridPublisher:
         ctx[path] = value
         return True
 
+    def _gate_tripped(self, readings) -> bool:
+        """True iff this frame's live readings must be published.
+
+        *readings* is a list of ``(path, reading, band, step)``.  Triggers:
+
+        - the path has no reference (first frame, after ``reset()`` or a
+          disconnect, or a path that newly applies);
+        - ``abs(reading - reference) >= band``;
+        - the displayed value goes to zero from non-zero, or leaves zero
+          by at least one display step.
+
+        The zero rule works on displayed values so that idle-leg noise
+        that displays as 0 (e.g. 0.0 / 0.3 W) stays silent, and it is
+        asymmetric so noise between zero and one step cannot flap it:
+        once a displayed zero is published, a reading must reach a full
+        step to leave it.
+        """
+        refs = self._references
+        for path, reading, band, step in readings:
+            ref = refs.get(path)
+            if ref is None:
+                return True
+            if abs(reading - ref) >= band * (1.0 - _CMP_EPS):
+                return True
+            ref_shown_zero = _round_to(ref, step) == 0
+            if not ref_shown_zero and _round_to(reading, step) == 0:
+                return True
+            if ref_shown_zero and abs(reading) >= step * (1.0 - _CMP_EPS):
+                return True
+        return False
+
     def publish(self, svc, data, connected: bool) -> bool:
         """Push one ``WatchdogData`` snapshot to *svc*.
 
@@ -212,6 +338,13 @@ class GridPublisher:
         ``ItemsChanged`` signal at __exit__.  When the cache shows
         nothing actually changed, ``/UpdateIndex`` stays put and vedbus
         suppresses the ItemsChanged entirely (empty changes dict).
+
+        Ungated paths (``/Connected``, ``/LastUpdate``, ``/NrOfPhases``,
+        ``/ErrorCode``, ``/ErrorMessage``, ``/Alarms/*``, the energy
+        counters) are written whenever their value changes.  The live
+        measurements are written as one frame, only when
+        ``_gate_tripped`` says so or an ungated path was written in the
+        same frame; see the module docstring.
 
         When ``connected`` is False, the instantaneous-measurement
         paths (V / I / P / Frequency on each line and the totals) are
@@ -224,7 +357,8 @@ class GridPublisher:
         misleading.  Cumulative energy counters
         (``/Ac/{L1,L2,}/Energy/Forward``) are preserved across the
         disconnect because they represent persistent state, not a
-        live measurement.
+        live measurement.  The hysteresis references are dropped, so
+        the first connected frame afterwards publishes in full.
 
         Returns True iff at least one path was actually written.
         """
@@ -237,15 +371,9 @@ class GridPublisher:
                 # Null out everything that represents a live reading.
                 # vedbus treats None as "no value" and dbus-systemcalc-py
                 # excludes None-valued paths from its sums.
-                for path in (
-                    "/Ac/L1/Voltage", "/Ac/L1/Current", "/Ac/L1/Power",
-                    "/Ac/L1/Frequency",
-                    "/Ac/L2/Voltage", "/Ac/L2/Current", "/Ac/L2/Power",
-                    "/Ac/L2/Frequency",
-                    "/Ac/Power", "/Ac/Current", "/Ac/Voltage",
-                    "/Ac/Frequency",
-                ):
+                for path in GRID_LIVE_PATHS:
                     any_changed |= self._set_if_changed(ctx, path, None)
+                self._references.clear()
 
                 # /Alarms/* and /ErrorCode are NOT cleared on disconnect
                 # — the last-known fault is more useful to the user than
@@ -259,6 +387,7 @@ class GridPublisher:
                 return any_changed
 
             if data.timestamp > 0:
+                # ── Ungated paths: written whenever they change ──
                 # Freshness, throttled.  data.timestamp is set only when a
                 # frame actually PARSED, so this is the one path that can
                 # not read as healthy while the parser is dead — the
@@ -270,46 +399,14 @@ class GridPublisher:
                     self._last_update_published = data.timestamp
 
                 l1 = data.l1
-                any_changed |= self._set_if_changed(
-                    ctx, "/Ac/L1/Voltage",
-                    _round_to(l1.voltage, GRID_VOLTAGE_STEP))
-                any_changed |= self._set_if_changed(
-                    ctx, "/Ac/L1/Current",
-                    _round_to(l1.current, GRID_CURRENT_STEP))
-                any_changed |= self._set_if_changed(
-                    ctx, "/Ac/L1/Power",
-                    _round_to(l1.power, GRID_POWER_STEP))
-                any_changed |= self._set_if_changed(
-                    ctx, "/Ac/L1/Energy/Forward",
-                    _round_to(l1.energy, GRID_ENERGY_STEP))
-                if l1.frequency > 0:
-                    any_changed |= self._set_if_changed(
-                        ctx, "/Ac/L1/Frequency",
-                        _round_to(l1.frequency, GRID_FREQ_STEP))
+                has_l2 = data.has_l2
+                l2 = data.l2 if has_l2 else None
 
                 total_power = l1.power
                 total_current = l1.current
                 total_energy = l1.energy
                 error_code = l1.error_code
-
-                if data.has_l2:
-                    l2 = data.l2
-                    any_changed |= self._set_if_changed(
-                        ctx, "/Ac/L2/Voltage",
-                        _round_to(l2.voltage, GRID_VOLTAGE_STEP))
-                    any_changed |= self._set_if_changed(
-                        ctx, "/Ac/L2/Current",
-                        _round_to(l2.current, GRID_CURRENT_STEP))
-                    any_changed |= self._set_if_changed(
-                        ctx, "/Ac/L2/Power",
-                        _round_to(l2.power, GRID_POWER_STEP))
-                    any_changed |= self._set_if_changed(
-                        ctx, "/Ac/L2/Energy/Forward",
-                        _round_to(l2.energy, GRID_ENERGY_STEP))
-                    if l2.frequency > 0:
-                        any_changed |= self._set_if_changed(
-                            ctx, "/Ac/L2/Frequency",
-                            _round_to(l2.frequency, GRID_FREQ_STEP))
+                if has_l2:
                     total_power += l2.power
                     total_current += l2.current
                     total_energy += l2.energy
@@ -317,26 +414,17 @@ class GridPublisher:
                         error_code = l2.error_code
 
                 any_changed |= self._set_if_changed(
-                    ctx, "/NrOfPhases", 2 if data.has_l2 else 1)
-                any_changed |= self._set_if_changed(
-                    ctx, "/Ac/Power",
-                    _round_to(total_power, GRID_POWER_STEP))
-                any_changed |= self._set_if_changed(
-                    ctx, "/Ac/Current",
-                    _round_to(total_current, GRID_CURRENT_STEP))
-                avg_voltage = l1.voltage
-                if data.has_l2 and data.l2.voltage > 0:
-                    avg_voltage = (l1.voltage + data.l2.voltage) / 2.0
-                any_changed |= self._set_if_changed(
-                    ctx, "/Ac/Voltage",
-                    _round_to(avg_voltage, GRID_VOLTAGE_STEP))
-                if l1.frequency > 0:
+                    ctx, "/Ac/L1/Energy/Forward",
+                    _round_to(l1.energy, GRID_ENERGY_STEP))
+                if has_l2:
                     any_changed |= self._set_if_changed(
-                        ctx, "/Ac/Frequency",
-                        _round_to(l1.frequency, GRID_FREQ_STEP))
+                        ctx, "/Ac/L2/Energy/Forward",
+                        _round_to(l2.energy, GRID_ENERGY_STEP))
                 any_changed |= self._set_if_changed(
                     ctx, "/Ac/Energy/Forward",
                     _round_to(total_energy, GRID_ENERGY_STEP))
+                any_changed |= self._set_if_changed(
+                    ctx, "/NrOfPhases", 2 if has_l2 else 1)
                 any_changed |= self._set_if_changed(
                     ctx, "/ErrorCode", error_code)
                 any_changed |= self._set_if_changed(
@@ -346,12 +434,22 @@ class GridPublisher:
                 # Pick the faulting line's input voltage so the
                 # low/high split uses the leg that actually tripped.
                 alarm_voltage = l1.voltage
-                if data.has_l2 and data.l2.error_code in (1, 2):
-                    alarm_voltage = data.l2.voltage
+                if has_l2 and l2.error_code in (1, 2):
+                    alarm_voltage = l2.voltage
                 active_alarms = _alarms_for_state(error_code, alarm_voltage)
                 for path in GRID_ALARM_PATHS:
                     any_changed |= self._set_if_changed(
                         ctx, path, active_alarms.get(path, 0))
+
+                # ── Gated paths: the live measurements, as one frame ──
+                readings = self._live_readings(
+                    l1, l2, total_power, total_current)
+                if any_changed or self._gate_tripped(readings):
+                    for path, reading, _band, step in readings:
+                        any_changed |= self._set_if_changed(
+                            ctx, path, _round_to(reading, step))
+                    self._references = {
+                        path: reading for path, reading, _b, _s in readings}
 
                 if any_changed:
                     self._update_index = (self._update_index + 1) % 256
@@ -359,3 +457,39 @@ class GridPublisher:
                         ctx, "/UpdateIndex", self._update_index)
 
             return any_changed
+
+    @staticmethod
+    def _live_readings(l1, l2, total_power: float, total_current: float):
+        """This frame's ``(path, reading, band, step)`` for every live
+        path that applies: L2 only when present, a frequency only when
+        its leg reports one above 0."""
+        readings = []
+
+        def leg(prefix, line):
+            readings.append((prefix + "/Voltage", line.voltage,
+                             GRID_VOLTAGE_BAND, GRID_VOLTAGE_STEP))
+            readings.append((prefix + "/Current", line.current,
+                             GRID_CURRENT_BAND, GRID_CURRENT_STEP))
+            readings.append((prefix + "/Power", line.power,
+                             GRID_POWER_BAND, GRID_POWER_STEP))
+            if line.frequency > 0:
+                readings.append((prefix + "/Frequency", line.frequency,
+                                 GRID_FREQ_BAND, GRID_FREQ_STEP))
+
+        leg("/Ac/L1", l1)
+        if l2 is not None:
+            leg("/Ac/L2", l2)
+
+        avg_voltage = l1.voltage
+        if l2 is not None and l2.voltage > 0:
+            avg_voltage = (l1.voltage + l2.voltage) / 2.0
+        readings.append(("/Ac/Power", total_power,
+                         GRID_POWER_BAND, GRID_POWER_STEP))
+        readings.append(("/Ac/Current", total_current,
+                         GRID_CURRENT_BAND, GRID_CURRENT_STEP))
+        readings.append(("/Ac/Voltage", avg_voltage,
+                         GRID_VOLTAGE_BAND, GRID_VOLTAGE_STEP))
+        if l1.frequency > 0:
+            readings.append(("/Ac/Frequency", l1.frequency,
+                             GRID_FREQ_BAND, GRID_FREQ_STEP))
+        return readings

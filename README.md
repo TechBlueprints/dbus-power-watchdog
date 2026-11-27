@@ -102,6 +102,14 @@ and `now - /LastUpdate` for whether frames are still arriving. The separate
 the per-device enable switches), so its own `/Connected` describes the manager
 and stays 1 while the device is off.
 
+The live measurements (`/Ac/L1/*`, `/Ac/L2/*` and the totals, except the
+energy counters) are published as one frame, only when a reading has moved a
+full hysteresis band since the last published frame, a value goes to or from
+zero, or another path (an energy tick, an alarm, `/Connected`, the
+once-a-minute `/LastUpdate`) changes. A steady load therefore shows a held
+value that is at most a minute old. The bands and display steps are the
+`GRID_*_BAND` and `GRID_*_STEP` constants in `grid_publisher.py`.
+
 ## Device Discovery
 
 Units are classified by their BLE name:

@@ -375,8 +375,8 @@ class PowerWatchdogDeviceService:
         """Called periodically by GLib to push BLE data to D-Bus.
 
         Delegates the actual write to ``GridPublisher.publish`` which
-        owns batched writes, coarse rounding, in-RAM dedup, and
-        /UpdateIndex gating — see ``grid_publisher.py``.
+        owns batched writes, the hysteresis gate, display rounding,
+        in-RAM dedup, and /UpdateIndex gating — see ``grid_publisher.py``.
         """
         data = self._ble.get_data()
         connected = self._ble.connected
