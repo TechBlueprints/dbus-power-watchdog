@@ -67,7 +67,8 @@ on a flat load the service emits one ItemsChanged a minute (the
 ``/LastUpdate`` tick) plus one per energy-counter tick.  Under the old
 rounded-equality gate a reading sitting on a step boundary signalled
 on nearly every poll (0.6-0.7 IC/s measured on prod on 2026-11-26 at a
-1400 ms poll).
+1400 ms poll); replaying a 900 s prod capture through this code leaves
+0.136 IC/s (see the GRID_*_BAND comments).
 
 Caller contract:
 
@@ -101,10 +102,43 @@ GRID_ENERGY_STEP = 0.01     # kWh — counter, monotone, fine resolution useful
 # triggers).  Each band should sit above the reading's measured
 # frame-to-frame noise on a steady load, so noise alone never trips it.
 # Energy counters are not banded: they publish on every GRID_ENERGY_STEP.
-GRID_POWER_BAND = 10        # W  — PROVISIONAL; measured noise: (pending capture)
-GRID_CURRENT_BAND = 0.1     # A  — PROVISIONAL; measured noise: (pending capture)
-GRID_VOLTAGE_BAND = 1.0     # V  — PROVISIONAL; measured noise: (pending capture)
-GRID_FREQ_BAND = 0.1        # Hz — PROVISIONAL; measured noise: (pending capture)
+#
+# Measured on prod, 2026-11-27 16:46:24Z-17:01:24Z (900 s, /RefreshTime
+# 1400 ms, light load drifting slowly, L1 215-360 W, no air-conditioner
+# cycle): 568 signals = 0.631/s, 88 % of timer ticks.  Capture and analysis:
+# measurements/2026-11-27-grid-values-prod.json, reproduced by
+#     python3 scripts/grid_value_capture.py --report <that file>
+#     python3 scripts/grid_value_capture.py --sweep <that file>
+#     python3 scripts/grid_value_capture.py --replay-publisher <that file>
+# The last one runs the capture through this module: with these bands it
+# leaves 122 signals = 0.136/s, 21 % of before.  (--sweep's model says
+# 0.148/s; it gates the captured /Ac/* totals as readings of their own,
+# while this code derives them from the legs, and that accounts for all
+# 11 extra signals.)  The floor from energy ticks plus /LastUpdate is
+# 0.025/s.
+#
+# The power, current and voltage bands are two display steps each: the
+# smallest band that clears one-step flapping, which was most of the
+# churn (frequency's is one step and unmeasured).  Wider bands would cut
+# further (15 W / 0.15 A: 0.091/s in the sweep, a further ~0.057/s) at
+# the price of holding back changes up to that size for as long as
+# LAST_UPDATE_INTERVAL.  Limits: the replay ran on values already rounded
+# to the display steps, from one capture under one load condition; the
+# measurement after deploy decides whether to widen.
+GRID_POWER_BAND = 10        # W  — 662 changes over the 3 power paths, 48.6 % flaps
+                            #      across one 5 W boundary; /Ac/Power 267 of 333
+                            #      changes one step, 32 two.  Sweep, signals/s with
+                            #      a power cause: 10 W 0.108, 15 W 0.061, 20 W 0.047,
+                            #      30 W 0.018.
+GRID_CURRENT_BAND = 0.1     # A  — 534 changes, 56.6 % flaps; /Ac/L1/Current 228 of
+                            #      275 one step; idle L2 flapped 0.4/0.45 A (25 of
+                            #      26).  Sweep, with a current cause: 0.1 A 0.067,
+                            #      0.15 A 0.026, 0.2 A 0.007.
+GRID_VOLTAGE_BAND = 1.0     # V  — 116 changes, 86.2 % flaps, all but two one 0.5 V
+                            #      step.  Sweep: 1.0 V leaves 0.002/s with a voltage
+                            #      cause; 1.5 V and 2.0 V remove nothing more.
+GRID_FREQ_BAND = 0.1        # Hz — NOT measured: frequency read 60.0 throughout the
+                            #      900 s, no change at all.  One display step.
 
 # How often /LastUpdate is rewritten while parsed telemetry flows.  It is
 # the freshness signal the hysteresis-gated measurement paths cannot be:

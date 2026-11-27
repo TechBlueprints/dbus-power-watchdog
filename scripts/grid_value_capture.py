@@ -26,6 +26,7 @@ Analysis (runs anywhere, standard library only):
 
     python3 scripts/grid_value_capture.py --report x.json
     python3 scripts/grid_value_capture.py --sweep x.json [--full]
+    python3 scripts/grid_value_capture.py --replay-publisher x.json
 
 ``--sweep`` replays the gate planned for ``grid_publisher.py``: each live
 measurement path keeps the reading at the last published frame as its
@@ -37,7 +38,26 @@ ungated path changed (``/Connected``, ``/NrOfPhases``, ``/ErrorCode``,
 published frame writes every measurement path and resets every reference.
 The captured values are already rounded to today's steps, so they stand in
 for the readings; the row with bands equal to today's steps reproduces the
-capture.
+capture. The model gates the captured ``/Ac/*`` totals as readings of their
+own, but they are the rounded unrounded sum and often sit a step off the sum
+of the rounded legs, so the sweep over-counts: on the 2026-11-27 capture at
+10 W / 0.1 A / 1.0 V / 0.1 Hz it says 133 signals where the real code says
+122, and deriving the totals from the legs in the model gives 122 exactly.
+Its zero rule is also the literal "exactly 0", not the code's displayed-zero
+rule (no zero crossings in that capture, so no difference there). Use the
+sweep to compare bands, and ``--replay-publisher`` for the figure.
+
+``--replay-publisher`` feeds the capture through the real
+``grid_publisher.GridPublisher`` instead of the model above, against an
+in-memory service that counts emitted signals. It rebuilds one
+``WatchdogData`` per timer tick from the captured leg paths (the real code
+derives ``/Ac/*`` totals and the total energy from the legs, so the captured
+totals are not inputs), stamps each tick with the capture's wall clock so
+``/LastUpdate`` runs on its real 60 s throttle, and starts the publisher from
+the seed state and the seed's ``/LastUpdate`` phase. Ticks between captured
+signals, when prod published nothing, are fed too, at ``/RefreshTime``
+spacing, carrying the unchanged state. Needs the repository root on the
+import path (it adds it itself); standard library otherwise.
 """
 import json
 import sys
@@ -434,11 +454,138 @@ def sweep(path, full=False):
                   % (n, len([f for f in frames if f[2]])))
 
 
+# ------------------------------------------------- replay through real code --
+
+class _CountingService:
+    """Just enough of vedbus.VeDbusService: declared paths, ``with svc as
+    ctx`` batching, dedup on equal values, one emit per non-empty batch."""
+
+    def __init__(self, paths):
+        self.values = dict((p, None) for p in paths)
+        self.emits = []             # [(t, {path: value})]
+        self.now = 0.0
+        self._batch = None
+
+    def __contains__(self, path):
+        return path in self.values
+
+    def __setitem__(self, path, value):
+        if self.values.get(path) == value:
+            return
+        self.values[path] = value
+        self._batch[path] = value
+
+    def __enter__(self):
+        self._batch = {}
+        return self
+
+    def __exit__(self, *exc):
+        if self._batch:
+            self.emits.append((self.now, self._batch))
+        self._batch = None
+        return None
+
+
+def _watchdog_data(state, timestamp):
+    """A WatchdogData stand-in from captured path values (None reads as 0)."""
+    from types import SimpleNamespace
+
+    def leg(prefix, error_code):
+        def g(name):
+            v = state.get(prefix + name)
+            return v if _num(v) else 0.0
+        return SimpleNamespace(voltage=g("/Voltage"), current=g("/Current"),
+                               power=g("/Power"), energy=g("/Energy/Forward"),
+                               frequency=g("/Frequency"), error_code=error_code)
+
+    code = state.get("/ErrorCode") or 0
+    has_l2 = state.get("/NrOfPhases") == 2
+    return SimpleNamespace(l1=leg("/Ac/L1", code), l2=leg("/Ac/L2", 0),
+                           has_l2=has_l2, timestamp=timestamp)
+
+
+def replay_publisher(path):
+    import os
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    import grid_publisher as gp
+
+    d = _load(path)
+    dur = d["duration"]
+    _header(d)
+    wall = d["wall_minus_mono"]
+    rt = (d.get("refresh_time_ms") or 1000) / 1000.0
+    paths = (list(gp.GRID_LIVE_PATHS) + list(ENERGY) + list(gp.GRID_ALARM_PATHS)
+             + ["/Connected", "/NrOfPhases", "/UpdateIndex", "/ErrorCode",
+                "/ErrorMessage", LAST_UPDATE])
+    svc = _CountingService(paths)
+    pub = gp.GridPublisher()
+
+    def tick(t, state):
+        svc.now = t
+        pub.publish(svc, _watchdog_data(state, t + wall), state.get("/Connected") == 1)
+
+    # Prime from the seed (not counted), then take prod's /LastUpdate phase.
+    state = dict(d["seed"])
+    t_seed = d.get("t_seed_mono", d["t0_mono"])
+    tick(t_seed, state)
+    if _num(state.get(LAST_UPDATE)):
+        pub._last_update_published = float(state[LAST_UPDATE])
+    svc.emits = []
+
+    ticks = 0
+    prev_t = t_seed
+    for t, _m, items in d["events"]:
+        # Ticks prod ran without signalling: unchanged state, RefreshTime apart.
+        k = 1
+        while prev_t + k * rt < t - rt / 2:
+            tick(prev_t + k * rt, state)
+            ticks += 1
+            k += 1
+        state.update(items)
+        tick(t, state)
+        ticks += 1
+        prev_t = t
+    end = d["t0_mono"] + dur
+    k = 1
+    while prev_t + k * rt < end:
+        tick(prev_t + k * rt, state)
+        ticks += 1
+        k += 1
+
+    n = len(svc.emits)
+    print("\nreal grid_publisher bands: P %g W  I %g A  V %g V  F %g Hz" % (
+        gp.GRID_POWER_BAND, gp.GRID_CURRENT_BAND, gp.GRID_VOLTAGE_BAND, gp.GRID_FREQ_BAND))
+    print("timer ticks fed: %d (%d captured signals, the rest unchanged state)" % (
+        ticks, len(d["events"])))
+    print("signals: %d = %.3f/s  (capture: %d = %.3f/s, %.0f%%)" % (
+        n, n / dur, len(d["events"]), len(d["events"]) / dur,
+        100.0 * n / len(d["events"]) if d["events"] else 0))
+    carried = {}
+    for _t, batch in svc.emits:
+        kinds = set()
+        for p in batch:
+            if p in ENERGY:
+                kinds.add("energy")
+            elif p == LAST_UPDATE:
+                kinds.add("lastupdate")
+            elif p in MEASUREMENT:
+                kinds.add("measurement")
+            elif p not in DERIVED:
+                kinds.add("other")
+        k = "+".join(sorted(kinds)) or "(UpdateIndex only)"
+        carried[k] = carried.get(k, 0) + 1
+    print("signals by what they carried:")
+    for k, c in sorted(carried.items(), key=lambda kv: -kv[1]):
+        print("  %7.3f/s  %5d  %s" % (c / dur, c, k))
+
+
 if __name__ == "__main__":
     a = sys.argv[1:]
     if len(a) >= 2 and a[0] == "--report":
         report(a[1])
     elif len(a) >= 2 and a[0] == "--sweep":
         sweep(a[1], full="--full" in a[2:])
+    elif len(a) >= 2 and a[0] == "--replay-publisher":
+        replay_publisher(a[1])
     else:
         capture(float(a[0]) if a else 60.0)
