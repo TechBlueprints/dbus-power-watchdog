@@ -229,7 +229,7 @@ class TestFirstCycle:
                                                           gp.GRID_VOLTAGE_STEP)
 
 
-# ── Coarse rounding suppresses noise flicker ───────────────────────────────
+# ── Noise flicker inside one step / one band does not emit ────────────────
 
 
 class TestRoundingSuppressesNoise:
@@ -260,7 +260,7 @@ class TestRoundingSuppressesNoise:
         # /UpdateIndex must NOT advance when nothing else changed
         assert svc._values["/UpdateIndex"] == 1
 
-    def test_voltage_jump_across_step_does_emit(self):
+    def test_voltage_jump_of_one_band_does_emit(self):
         svc = FakeVeDbusService()
         _full_grid_paths(svc)
         pub = gp.GridPublisher()
@@ -268,13 +268,16 @@ class TestRoundingSuppressesNoise:
         snap1 = _Snapshot(l1=_Line(voltage=119.4, current=10.0, power=1200.0))
         pub.publish(svc, snap1, connected=True)
 
-        # 119.4 rounds to 119.5; 120.0 rounds to 120.0 — different bucket
-        snap2 = _Snapshot(l1=_Line(voltage=120.0, current=10.0, power=1200.0))
+        # A move of one full hysteresis band publishes, and lands in a
+        # different display bucket.
+        v2 = 119.4 + gp.GRID_VOLTAGE_BAND
+        snap2 = _Snapshot(l1=_Line(voltage=v2, current=10.0, power=1200.0))
         any_changed = pub.publish(svc, snap2, connected=True)
 
         assert any_changed is True
         assert svc.emit_count == 2
-        assert svc._values["/Ac/L1/Voltage"] == 120.0
+        assert svc._values["/Ac/L1/Voltage"] == gp._round_to(v2, gp.GRID_VOLTAGE_STEP)
+        assert svc._values["/Ac/L1/Voltage"] != gp._round_to(119.4, gp.GRID_VOLTAGE_STEP)
         assert svc._values["/UpdateIndex"] == 2  # bumped
 
 
@@ -333,12 +336,12 @@ class TestUpdateIndexGating:
         pub = gp.GridPublisher()
 
         # Force 257 distinct cycles by varying current each time.  Use
-        # increments large enough that the rounding step doesn't
-        # collapse them.
+        # increments of one hysteresis band so the gate publishes every
+        # one of them, each into a different display bucket.
         for i in range(257):
             snap = _Snapshot(l1=_Line(
                 voltage=120.0,
-                current=i * gp.GRID_CURRENT_STEP * 2,
+                current=i * max(gp.GRID_CURRENT_BAND, gp.GRID_CURRENT_STEP * 2),
                 power=1200.0,
             ))
             pub.publish(svc, snap, connected=True)
@@ -624,7 +627,7 @@ class TestPreData:
 # ── /LastUpdate: the freshness flag that cannot lie ───────────────────────
 #
 # /Connected reads 1 while a link carries nothing, and /UpdateIndex is gated
-# behind the flicker-suppression steps, so a flat load holds it still even
+# behind the hysteresis gate, so a flat load holds it still even
 # with fresh frames.  /LastUpdate is written from data.timestamp — set only
 # when a frame actually PARSED — at most once per LAST_UPDATE_INTERVAL.
 
@@ -700,3 +703,371 @@ class TestLastUpdate:
         pub = gp.GridPublisher()
         pub.publish(svc, _Snapshot(timestamp=1000.0), connected=True)
         assert "/LastUpdate" not in svc._values
+
+
+# ── Hysteresis gate on the live measurements ──────────────────────────────
+#
+# The twelve live measurement paths (V / I / P / Frequency on each leg and
+# the totals) publish as one frame, and only when something triggers it:
+# a reading that moved a full band from the reading at the last published
+# frame, a displayed zero/non-zero transition, a path with no reference
+# yet, or any ungated path (/Connected, /LastUpdate, energy, /NrOfPhases,
+# /ErrorCode, /ErrorMessage, /Alarms/*) actually being written.  Tests are
+# written against the band and step constants, not their numbers, so the
+# bands can be retuned from a measurement without touching this file.
+
+_LIVE_PATHS = (
+    "/Ac/L1/Voltage", "/Ac/L1/Current", "/Ac/L1/Power", "/Ac/L1/Frequency",
+    "/Ac/Voltage", "/Ac/Current", "/Ac/Power", "/Ac/Frequency",
+)
+
+_BASE_V = 120.0
+_BASE_I = 10.0
+_BASE_P = 1200.0
+_BASE_F = 60.0
+_BASE_E = 5.0
+
+
+def _frame(t: float = 1000.0, **kw) -> _Snapshot:
+    """One L1 frame at a steady base load, with fields overridden by *kw*."""
+    line = dict(voltage=_BASE_V, current=_BASE_I, power=_BASE_P,
+                energy=_BASE_E, frequency=_BASE_F, error_code=0)
+    line.update(kw)
+    return _Snapshot(l1=_Line(**line), timestamp=t)
+
+
+def _primed(*frames_kw) -> tuple[FakeVeDbusService, gp.GridPublisher]:
+    """A service with /LastUpdate declared and one base frame published."""
+    svc = _lastupdate_svc()
+    pub = gp.GridPublisher()
+    pub.publish(svc, _frame(), connected=True)
+    assert svc.emit_count == 1
+    return svc, pub
+
+
+def _sub_band(band: float, step: float) -> float:
+    """A move under one band that still changes the displayed value.
+
+    Without a display change a suppressed move would be indistinguishable
+    from one that was written and deduped, so the precondition is checked.
+    """
+    move = band * 0.9
+    assert move >= step, "band %r too close to step %r for this test" % (band, step)
+    return move
+
+
+class TestHysteresisFlapping:
+    def test_power_flapping_across_a_step_boundary_publishes_once(self):
+        # e.g. 1202 / 1203 W around the 1202.5 W boundary of a 5 W step.
+        step, band = gp.GRID_POWER_STEP, gp.GRID_POWER_BAND
+        boundary = _BASE_P + step / 2.0
+        delta = min(step, band) / 5.0
+        svc, pub = _primed()
+        start = svc.emit_count
+        for i in range(30):
+            p = boundary - delta if i % 2 == 0 else boundary + delta
+            pub.publish(svc, _frame(t=1001.0 + i, power=p), connected=True)
+        # The first flapping frame crosses no band either (it is within
+        # step/2 + delta of the base), so the whole run is silent.
+        assert svc.emit_count == start
+
+    def test_voltage_flapping_across_a_step_boundary_publishes_once(self):
+        # e.g. 119.74 / 119.76 V around the 119.75 V boundary of a 0.5 V step.
+        step, band = gp.GRID_VOLTAGE_STEP, gp.GRID_VOLTAGE_BAND
+        boundary = 119.5 + step / 2.0
+        delta = min(step, band) / 25.0
+        svc = _lastupdate_svc()
+        pub = gp.GridPublisher()
+        for i in range(30):
+            v = boundary - delta if i % 2 == 0 else boundary + delta
+            pub.publish(svc, _frame(t=1000.0 + i, voltage=v), connected=True)
+        assert svc.emit_count == 1
+
+
+class TestHysteresisBand:
+    @pytest.mark.parametrize("field_name,path,band", [
+        ("power", "/Ac/L1/Power", gp.GRID_POWER_BAND),
+        ("current", "/Ac/L1/Current", gp.GRID_CURRENT_BAND),
+        ("voltage", "/Ac/L1/Voltage", gp.GRID_VOLTAGE_BAND),
+        ("frequency", "/Ac/L1/Frequency", gp.GRID_FREQ_BAND),
+    ])
+    def test_move_of_exactly_one_band_publishes(self, field_name, path, band):
+        svc, pub = _primed()
+        base = {"power": _BASE_P, "current": _BASE_I,
+                "voltage": _BASE_V, "frequency": _BASE_F}[field_name]
+        assert pub.publish(svc, _frame(t=1001.0, **{field_name: base + band}),
+                           connected=True) is True
+        assert svc.emit_count == 2
+        assert path in svc.last_changes
+
+    @pytest.mark.parametrize("field_name,band,step", [
+        ("power", gp.GRID_POWER_BAND, gp.GRID_POWER_STEP),
+        ("current", gp.GRID_CURRENT_BAND, gp.GRID_CURRENT_STEP),
+        ("voltage", gp.GRID_VOLTAGE_BAND, gp.GRID_VOLTAGE_STEP),
+    ])
+    def test_move_just_under_one_band_does_not_publish(self, field_name, band, step):
+        svc, pub = _primed()
+        base = {"power": _BASE_P, "current": _BASE_I, "voltage": _BASE_V}[field_name]
+        move = _sub_band(band, step)
+        assert pub.publish(svc, _frame(t=1001.0, **{field_name: base + move}),
+                           connected=True) is False
+        assert svc.emit_count == 1
+
+    def test_slow_drift_publishes_when_the_total_reaches_the_band(self):
+        band = gp.GRID_CURRENT_BAND
+        svc, pub = _primed()
+        quarter = band / 4.0
+        for k in (1, 2, 3):
+            pub.publish(svc, _frame(t=1000.0 + k, current=_BASE_I + k * quarter),
+                        connected=True)
+            assert svc.emit_count == 1, "published after %d sub-band steps" % k
+        pub.publish(svc, _frame(t=1004.0, current=_BASE_I + 4 * quarter),
+                    connected=True)
+        assert svc.emit_count == 2
+        assert svc._values["/Ac/L1/Current"] == gp._round_to(
+            _BASE_I + band, gp.GRID_CURRENT_STEP)
+
+    def test_reference_moves_only_on_publish(self):
+        # After a publish the band is measured from the new frame, not the
+        # original one: a second full band is needed for the next signal.
+        band = gp.GRID_POWER_BAND
+        svc, pub = _primed()
+        pub.publish(svc, _frame(t=1001.0, power=_BASE_P + band), connected=True)
+        assert svc.emit_count == 2
+        pub.publish(svc, _frame(t=1002.0, power=_BASE_P + band * 1.5), connected=True)
+        assert svc.emit_count == 2
+        pub.publish(svc, _frame(t=1003.0, power=_BASE_P + band * 2), connected=True)
+        assert svc.emit_count == 3
+
+
+class TestHysteresisCoherentFrame:
+    def test_power_crossing_carries_the_frames_current_and_voltage(self):
+        svc, pub = _primed()
+        dv = _sub_band(gp.GRID_VOLTAGE_BAND, gp.GRID_VOLTAGE_STEP)
+        di = _sub_band(gp.GRID_CURRENT_BAND, gp.GRID_CURRENT_STEP)
+        # Sub-band drift on V and I alone: held back.
+        pub.publish(svc, _frame(t=1001.0, voltage=_BASE_V + dv,
+                                current=_BASE_I + di), connected=True)
+        assert svc.emit_count == 1
+        # Power crosses: the same signal carries this frame's V and I.
+        pub.publish(svc, _frame(t=1002.0, voltage=_BASE_V + dv,
+                                current=_BASE_I + di,
+                                power=_BASE_P + gp.GRID_POWER_BAND),
+                    connected=True)
+        assert svc.emit_count == 2
+        ch = svc.last_changes
+        assert ch["/Ac/L1/Power"] == gp._round_to(
+            _BASE_P + gp.GRID_POWER_BAND, gp.GRID_POWER_STEP)
+        assert ch["/Ac/L1/Voltage"] == gp._round_to(_BASE_V + dv, gp.GRID_VOLTAGE_STEP)
+        assert ch["/Ac/L1/Current"] == gp._round_to(_BASE_I + di, gp.GRID_CURRENT_STEP)
+        assert ch["/Ac/Voltage"] == ch["/Ac/L1/Voltage"]
+        assert ch["/Ac/Current"] == ch["/Ac/L1/Current"]
+
+    def test_current_crossing_refreshes_power(self):
+        svc, pub = _primed()
+        dp = _sub_band(gp.GRID_POWER_BAND, gp.GRID_POWER_STEP)
+        pub.publish(svc, _frame(t=1001.0, power=_BASE_P + dp), connected=True)
+        assert svc.emit_count == 1
+        pub.publish(svc, _frame(t=1002.0, power=_BASE_P + dp,
+                                current=_BASE_I + gp.GRID_CURRENT_BAND),
+                    connected=True)
+        assert svc.emit_count == 2
+        assert svc.last_changes["/Ac/L1/Power"] == gp._round_to(
+            _BASE_P + dp, gp.GRID_POWER_STEP)
+        assert svc.last_changes["/Ac/Power"] == svc.last_changes["/Ac/L1/Power"]
+
+    def test_l2_and_totals_publish_together(self):
+        # A band crossing on L2 refreshes L1 and the totals from the same frame.
+        svc = _lastupdate_svc()
+        pub = gp.GridPublisher()
+
+        def snap(t, p1, p2):
+            return _Snapshot(
+                l1=_Line(voltage=120.0, current=10.0, power=p1, energy=1.0, frequency=60.0),
+                l2=_Line(voltage=121.0, current=8.0, power=p2, energy=1.0, frequency=60.0),
+                has_l2=True, timestamp=t)
+
+        pub.publish(svc, snap(1000.0, 1200.0, 960.0), connected=True)
+        dp = _sub_band(gp.GRID_POWER_BAND, gp.GRID_POWER_STEP)
+        pub.publish(svc, snap(1001.0, 1200.0 + dp, 960.0), connected=True)
+        assert svc.emit_count == 1
+        pub.publish(svc, snap(1002.0, 1200.0 + dp, 960.0 + gp.GRID_POWER_BAND),
+                    connected=True)
+        assert svc.emit_count == 2
+        ch = svc.last_changes
+        assert ch["/Ac/L1/Power"] == gp._round_to(1200.0 + dp, gp.GRID_POWER_STEP)
+        assert ch["/Ac/L2/Power"] == gp._round_to(960.0 + gp.GRID_POWER_BAND,
+                                                   gp.GRID_POWER_STEP)
+        assert ch["/Ac/Power"] == gp._round_to(
+            1200.0 + dp + 960.0 + gp.GRID_POWER_BAND, gp.GRID_POWER_STEP)
+
+
+class TestHysteresisImmediate:
+    def test_first_frame_after_construction_publishes(self):
+        svc = _lastupdate_svc()
+        pub = gp.GridPublisher()
+        assert pub.publish(svc, _frame(), connected=True) is True
+        for path in _LIVE_PATHS:
+            assert svc._values[path] is not None, path
+
+    def test_first_frame_after_reset_publishes(self):
+        svc, pub = _primed()
+        pub.reset()
+        svc2 = _lastupdate_svc()
+        assert pub.publish(svc2, _frame(t=1001.0), connected=True) is True
+        for path in _LIVE_PATHS:
+            assert svc2._values[path] is not None, path
+
+    def test_first_frame_after_disconnect_publishes_in_full(self):
+        svc, pub = _primed()
+        pub.publish(svc, _frame(t=1001.0), connected=False)
+        for path in _LIVE_PATHS:
+            assert svc._values[path] is None
+        pub.publish(svc, _frame(t=1002.0), connected=True)
+        for path in _LIVE_PATHS:
+            assert svc._values[path] is not None, path
+        assert svc._values["/Ac/L1/Power"] == _BASE_P
+
+    def test_reading_going_to_zero_and_back_publishes_under_the_band(self):
+        band, step = gp.GRID_POWER_BAND, gp.GRID_POWER_STEP
+        small = _sub_band(band, step)   # under the band, displays non-zero
+        svc = _lastupdate_svc()
+        pub = gp.GridPublisher()
+        pub.publish(svc, _frame(t=1000.0, power=small), connected=True)
+        assert svc._values["/Ac/L1/Power"] != 0
+        pub.publish(svc, _frame(t=1001.0, power=0.0), connected=True)
+        assert svc.emit_count == 2
+        assert svc._values["/Ac/L1/Power"] == 0
+        assert svc._values["/Ac/Power"] == 0
+        pub.publish(svc, _frame(t=1002.0, power=small), connected=True)
+        assert svc.emit_count == 3
+        assert svc._values["/Ac/L1/Power"] == gp._round_to(small, step)
+
+    def test_connected_change_publishes(self):
+        svc, pub = _primed()
+        assert pub.publish(svc, _frame(t=1001.0), connected=False) is True
+        assert svc.last_changes["/Connected"] == 0
+
+    @pytest.mark.parametrize("error_code", [1, 3, 7, 13])
+    def test_error_and_alarm_change_publishes_with_the_frame(self, error_code):
+        svc, pub = _primed()
+        dp = _sub_band(gp.GRID_POWER_BAND, gp.GRID_POWER_STEP)
+        assert pub.publish(svc, _frame(t=1001.0, error_code=error_code,
+                                       power=_BASE_P + dp),
+                           connected=True) is True
+        ch = svc.last_changes
+        assert ch["/ErrorCode"] == error_code
+        assert ch["/ErrorMessage"] == gp.ERROR_MESSAGES[error_code]
+        # The frame's measurements ride along in the same signal.
+        assert ch["/Ac/L1/Power"] == gp._round_to(_BASE_P + dp, gp.GRID_POWER_STEP)
+
+    def test_alarm_change_alone_publishes(self):
+        svc, pub = _primed()
+        pub.publish(svc, _frame(t=1001.0, error_code=13), connected=True)
+        assert svc.last_changes["/Alarms/HighTemperature"] == 2
+
+    def test_nr_of_phases_change_publishes(self):
+        svc, pub = _primed()
+        snap = _frame(t=1001.0)
+        snap.has_l2 = True
+        snap.l2 = _Line(voltage=_BASE_V, current=0.0, power=0.0,
+                        energy=0.0, frequency=_BASE_F)
+        assert pub.publish(svc, snap, connected=True) is True
+        assert svc.last_changes["/NrOfPhases"] == 2
+        assert svc._values["/Ac/L2/Voltage"] == _BASE_V
+
+
+class TestHysteresisNearZero:
+    @pytest.mark.parametrize("field_name,noise", [
+        ("power", 0.3),
+        # Above half a display step: old rounding flipped 0 <-> one step.
+        ("power", 0.6 * gp.GRID_POWER_STEP),
+        ("current", 0.6 * gp.GRID_CURRENT_STEP),
+    ])
+    def test_idle_leg_noise_inside_the_band_is_silent(self, field_name, noise):
+        band = {"power": gp.GRID_POWER_BAND, "current": gp.GRID_CURRENT_BAND}[field_name]
+        assert noise < band
+        svc = _lastupdate_svc()
+        pub = gp.GridPublisher()
+        idle = dict(power=0.0, current=0.0)
+        pub.publish(svc, _frame(t=1000.0, **idle), connected=True)
+        assert svc.emit_count == 1
+        for i in range(1, 40):
+            kw = dict(idle)
+            kw[field_name] = noise if i % 2 else 0.0
+            pub.publish(svc, _frame(t=1000.0 + i, **kw), connected=True)
+        assert svc.emit_count == 1
+
+
+class TestHysteresisUngatedRideAlong:
+    def test_energy_tick_publishes_at_once_with_the_frame(self):
+        svc, pub = _primed()
+        dp = _sub_band(gp.GRID_POWER_BAND, gp.GRID_POWER_STEP)
+        di = _sub_band(gp.GRID_CURRENT_BAND, gp.GRID_CURRENT_STEP)
+        # Held back first, so the energy tick is what releases them.
+        pub.publish(svc, _frame(t=1001.0, power=_BASE_P + dp,
+                                current=_BASE_I + di), connected=True)
+        assert svc.emit_count == 1
+        pub.publish(svc, _frame(t=1002.0, power=_BASE_P + dp,
+                                current=_BASE_I + di,
+                                energy=_BASE_E + gp.GRID_ENERGY_STEP),
+                    connected=True)
+        assert svc.emit_count == 2
+        ch = svc.last_changes
+        assert ch["/Ac/L1/Energy/Forward"] == gp._round_to(
+            _BASE_E + gp.GRID_ENERGY_STEP, gp.GRID_ENERGY_STEP)
+        assert ch["/Ac/L1/Power"] == gp._round_to(_BASE_P + dp, gp.GRID_POWER_STEP)
+        assert ch["/Ac/L1/Current"] == gp._round_to(_BASE_I + di, gp.GRID_CURRENT_STEP)
+
+    def test_last_update_tick_refreshes_a_drifted_reading(self):
+        svc, pub = _primed()
+        idx = svc._values["/UpdateIndex"]
+        dv = _sub_band(gp.GRID_VOLTAGE_BAND, gp.GRID_VOLTAGE_STEP)
+        interval = int(gp.LAST_UPDATE_INTERVAL)
+        for s in range(1, interval):
+            pub.publish(svc, _frame(t=1000.0 + s, voltage=_BASE_V + dv),
+                        connected=True)
+        # Between ticks: nothing on the bus, /UpdateIndex still.
+        assert svc.emit_count == 1
+        assert svc._values["/UpdateIndex"] == idx
+        assert svc._values["/Ac/L1/Voltage"] == _BASE_V
+        pub.publish(svc, _frame(t=1000.0 + interval, voltage=_BASE_V + dv),
+                    connected=True)
+        assert svc.emit_count == 2
+        ch = svc.last_changes
+        assert ch["/LastUpdate"] == 1000 + interval
+        assert ch["/Ac/L1/Voltage"] == gp._round_to(_BASE_V + dv, gp.GRID_VOLTAGE_STEP)
+        assert ch["/UpdateIndex"] == idx + 1
+
+    def test_flat_load_between_ticks_emits_nothing(self):
+        svc, pub = _primed()
+        idx = svc._values["/UpdateIndex"]
+        for s in range(1, int(gp.LAST_UPDATE_INTERVAL)):
+            assert pub.publish(svc, _frame(t=1000.0 + s), connected=True) is False
+        assert svc.emit_count == 1
+        assert svc._values["/UpdateIndex"] == idx
+
+
+class TestCleanDecimals:
+    def test_round_to_returns_the_clean_decimal(self):
+        assert gp._round_to(2.9, 0.05) == 2.9
+        assert repr(gp._round_to(2.9, 0.05)) == "2.9"
+
+    @pytest.mark.parametrize("step", [
+        gp.GRID_VOLTAGE_STEP, gp.GRID_CURRENT_STEP, gp.GRID_POWER_STEP,
+        gp.GRID_FREQ_STEP, gp.GRID_ENERGY_STEP,
+    ])
+    def test_buckets_unchanged_and_reprs_short(self, step):
+        decimals = max(0, -__import__("decimal").Decimal(str(step)).as_tuple().exponent)
+        for i in range(-2000, 2000):
+            v = i * 0.0137
+            got = gp._round_to(v, step)
+            assert got == pytest.approx(round(v / step) * step, abs=1e-9)
+            assert got == round(got, decimals), (v, step, got)
+
+    def test_published_current_is_a_clean_decimal(self):
+        svc = _lastupdate_svc()
+        pub = gp.GridPublisher()
+        pub.publish(svc, _frame(current=2.9), connected=True)
+        assert repr(svc._values["/Ac/L1/Current"]) == "2.9"
+        assert repr(svc._values["/Ac/Current"]) == "2.9"
